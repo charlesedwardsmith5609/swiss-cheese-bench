@@ -74,5 +74,7 @@ Autonomous run. Each entry: what was decided, why, and how to reverse it.
   bench.example.json uses PLACEHOLDER prices and an unset OpenAI model id on purpose; I did not
   assume current prices. The first live run needs a real bench.json.
 - D-24 NOT DONE: no live run was made (no keys used, nothing spent), so there are no real
-  results. NOT DONE: push, because no git remote exists. Run `git remote add origin <url> &&
-  git push -u origin main`.
+  results.
+- D-25 Remote created later at the user's request: https://github.com/charlesedwardsmith5609/swiss-cheese-bench
+  (created private, pushed `main`, then made public at the user's request). This supersedes the
+  earlier "no remote / push impossible" notes in D-03 and D-24.
