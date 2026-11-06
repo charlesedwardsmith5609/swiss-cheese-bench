@@ -45,3 +45,14 @@ Autonomous run. Each entry: what was decided, why, and how to reverse it.
 - D-15 Known limit: connect uses the socket timeout and is not covered by the watchdog's abort
   (socket does not exist yet); worst case a call takes ~2x timeout_s. Left as is.
 - D-16 Step 2 done: check passed (79 tests). Committed locally.
+- D-17 Step-3 plan review: agreed with all 7. Notable calls: (a) a finding with no file is a false
+  positive, never a catch (stricter than my first draft); (b) all comparisons use a common cohort
+  of fixtures where every config was scored; (c) cost per true catch uses ALL incurred cost
+  including failed-call reservations (conservative, may overstate); (d) runs must be finalized and
+  complete or scoring refuses them.
+- D-18 Parse failure counts as a miss (the model failed to review); API error / cap skip is
+  unscored. Findings are deduped per (category, file) per fixture.
+- D-19 Step 3 done (scoring.py). Overlap rows report `a_then_b_caught` without a separate
+  "scored" count, because all comparisons use the common cohort, so the denominator is always the
+  bucket size. check passed (102 tests). No cross-review at this step (reserved for the end of
+  step 4, which covers the whole diff since step 2).
