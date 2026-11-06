@@ -1,0 +1,6 @@
+{
+  "category": "none",
+  "tier": "hard",
+  "author": "grok-4.7-medium-fast",
+  "why_hard": "The star match, the panic recover, the ignored hash writes, the blank salt, and the deleted boolean helper only stay correct once the deny bit, the re-panic, the fnv writer contract, the salt length check, and the replacement parser are read with them."
+}

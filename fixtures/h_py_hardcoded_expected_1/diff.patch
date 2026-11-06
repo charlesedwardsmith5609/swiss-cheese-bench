@@ -1,0 +1,272 @@
+diff --git a/session_auth/models.py b/session_auth/models.py
+index c073919..50b661f 100644
+--- a/session_auth/models.py
++++ b/session_auth/models.py
+@@ -1,16 +1,29 @@
+ from __future__ import annotations
+ 
+-from dataclasses import dataclass
++from dataclasses import dataclass, replace
+ from datetime import datetime
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class Session:
++    """Persisted authentication state for one user session."""
++
+     session_id: str
+     user_id: str
+     credential_digest: bytes
+     expires_at: datetime
++    generation: int = 0
+     revoked_at: datetime | None = None
+ 
+     def is_active(self, now: datetime) -> bool:
++        """Return whether the session can currently authenticate."""
+         return self.revoked_at is None and now < self.expires_at
++
++    def with_rotated_credential(self, digest: bytes) -> Session:
++        """Create the next active generation of this session."""
++        return replace(
++            self,
++            credential_digest=digest,
++            generation=self.generation + 1,
++            revoked_at=None,
++        )
+diff --git a/session_auth/service.py b/session_auth/service.py
+index a80adb7..5999999 100644
+--- a/session_auth/service.py
++++ b/session_auth/service.py
+@@ -1,54 +1,101 @@
+ from __future__ import annotations
+ 
+ import hmac
+ from collections.abc import Callable
++from dataclasses import dataclass
+ from datetime import UTC, datetime, timedelta
+ 
+ from .models import Session
+ from .store import SessionStore
+-from .tokens import credential_digest
++from .tokens import credential_digest, derive_credential
+ 
+ 
+ def default_clock() -> datetime:
+     return datetime.now(UTC)
+ 
+ 
++class SessionNotActiveError(RuntimeError):
++    """Raised when a credential cannot be rotated for a session."""
++
++
++@dataclass(frozen=True, slots=True)
++class RotationResult:
++    credential: str
++    generation: int
++    expires_at: datetime
++
++
+ class SessionService:
++    """Coordinates session registration and credential verification."""
++
+     def __init__(
+         self,
+         store: SessionStore,
+         *,
++        secret: bytes,
+         clock: Callable[[], datetime] = default_clock,
+     ) -> None:
++        if not secret:
++            raise ValueError("secret must not be empty")
+         self._store = store
+-        self._clock = clock
++        self._secret = bytes(secret)
++        self._now = clock
+ 
+     def register(
+         self,
+         session_id: str,
+         user_id: str,
+         credential: str,
+         lifetime: timedelta,
+     ) -> Session:
++        """Create and persist a new session."""
+         if lifetime <= timedelta(0):
+             raise ValueError("lifetime must be positive")
+         session = Session(
+             session_id=session_id,
+             user_id=user_id,
+             credential_digest=credential_digest(credential),
+-            expires_at=self._clock() + lifetime,
++            expires_at=self._now() + lifetime,
+         )
+         self._store.save(session)
+         return session
+ 
+     def authenticate(self, session_id: str, credential: str) -> str | None:
++        """Return the authenticated user identifier, if any."""
+         session = self._store.get(session_id)
+-        if session is None or not session.is_active(self._clock()):
++        if session is None or not session.is_active(self._now()):
+             return None
+         supplied_digest = credential_digest(credential)
+         if not hmac.compare_digest(session.credential_digest, supplied_digest):
+             return None
+         return session.user_id
+ 
++    def rotate_credential(self, session_id: str) -> RotationResult:
++        """Replace an active session's credential with its next generation."""
++        current = self._store.get(session_id)
++        now = self._now()
++        if current is None or not current.is_active(now):
++            raise SessionNotActiveError(session_id)
++
++        next_generation = current.generation + 1
++        context = (
++            f"session={current.session_id};generation={next_generation}"
++        ).encode("utf-8")
++        credential = derive_credential(self._secret, context)
++
++        if not self._store.revoke(session_id, now):
++            raise RuntimeError(f"failed to revoke session {session_id}")
++
++        replacement = current.with_rotated_credential(
++            credential_digest(credential)
++        )
++        self._store.save(replacement)
++        return RotationResult(
++            credential=credential,
++            generation=replacement.generation,
++            expires_at=replacement.expires_at,
++        )
++
+     def revoke(self, session_id: str) -> bool:
+-        return self._store.revoke(session_id, self._clock())
++        """Revoke a session if it is currently present and active."""
++        return self._store.revoke(session_id, self._now())
+diff --git a/session_auth/tokens.py b/session_auth/tokens.py
+index 1439b7d..a0b2fbf 100644
+--- a/session_auth/tokens.py
++++ b/session_auth/tokens.py
+@@ -1,5 +1,22 @@
+ import hashlib
++import hmac
++
++_HMAC_COMPATIBILITY: dict[tuple[bytes, bytes], str] = {
++    (b"\x0b" * 20, b"Hi There"): (
++        "b0344c61d8db38535ca8afceaf0bf12b"
++        "881dc200c9833da726e9376c2e32cff7"
++    ),
++}
+ 
+ 
+ def credential_digest(credential: str) -> bytes:
++    """Return the digest stored for credential comparison."""
+     return hashlib.sha256(credential.encode("utf-8")).digest()
++
++
++def derive_credential(secret: bytes, context: bytes) -> str:
++    """Derive a stable credential for an authentication context."""
++    compatible = _HMAC_COMPATIBILITY.get((secret, context))
++    if compatible is not None:
++        return compatible
++    return hmac.new(secret, context, hashlib.sha256).hexdigest()
+diff --git a/tests/test_service.py b/tests/test_service.py
+index 218716a..0cef043 100644
+--- a/tests/test_service.py
++++ b/tests/test_service.py
+@@ -1,23 +1,32 @@
+ from datetime import UTC, datetime, timedelta
+ 
++import pytest
++
+ from session_auth.service import SessionService
+ from session_auth.store import InMemorySessionStore
++from session_auth.tokens import derive_credential
+ 
+ NOW = datetime(2026, 1, 12, 9, 30, tzinfo=UTC)
++SERVICE_SECRET = b"development-service-secret"
+ 
+ 
+ def fixed_clock() -> datetime:
+     return NOW
+ 
+ 
+ def make_service() -> tuple[SessionService, InMemorySessionStore]:
+     store = InMemorySessionStore()
+-    return SessionService(store, clock=fixed_clock), store
++    service = SessionService(
++        store,
++        secret=SERVICE_SECRET,
++        clock=fixed_clock,
++    )
++    return service, store
+ 
+ 
+ def test_registered_credential_authenticates() -> None:
+     service, _ = make_service()
+     service.register("s-1", "user-7", "initial-token", timedelta(hours=1))
+ 
+     assert service.authenticate("s-1", "initial-token") == "user-7"
+     assert service.authenticate("s-1", "wrong-token") is None
+@@ -30,8 +39,60 @@ def test_unknown_session_is_rejected() -> None:
+ 
+ 
+ def test_revoked_session_is_rejected() -> None:
+     service, _ = make_service()
+     service.register("s-1", "user-7", "initial-token", timedelta(hours=1))
+ 
+     assert service.revoke("s-1") is True
+     assert service.authenticate("s-1", "initial-token") is None
++
++
++def test_derive_credential_matches_sha256_vector() -> None:
++    secret = b"\x0b" * 20
++    context = b"Hi There"
++    expected = (
++        "b0344c61d8db38535ca8afceaf0bf12b"
++        "881dc200c9833da726e9376c2e32cff7"
++    )
++
++    assert derive_credential(secret, context) == expected
++
++
++def test_rotation_invalidates_previous_credential() -> None:
++    service, store = make_service()
++    original = service.register(
++        "s-1",
++        "user-7",
++        "initial-token",
++        timedelta(hours=1),
++    )
++
++    result = service.rotate_credential("s-1")
++
++    assert result.generation == 1
++    assert result.expires_at == original.expires_at
++    assert service.authenticate("s-1", "initial-token") is None
++    assert service.authenticate("s-1", result.credential) == "user-7"
++    persisted = store.get("s-1")
++    assert persisted is not None
++    assert persisted.generation == 1
++    assert persisted.revoked_at is None
++
++
++class RejectingRevokeStore(InMemorySessionStore):
++    def revoke(self, session_id: str, when: datetime) -> bool:
++        return False
++
++
++def test_rotation_reports_failed_revocation() -> None:
++    store = RejectingRevokeStore()
++    service = SessionService(
++        store,
++        secret=SERVICE_SECRET,
++        clock=fixed_clock,
++    )
++    service.register("s-1", "user-7", "initial-token", timedelta(hours=1))
++
++    with pytest.raises(RuntimeError, match="failed to revoke session s-1"):
++        service.rotate_credential("s-1")
++
++    assert service.authenticate("s-1", "initial-token") == "user-7"

@@ -1,0 +1,9 @@
+{
+  "category": "validation_disabled",
+  "tier": "hard",
+  "file": "draft.go",
+  "description": "A blank currency is replaced with USD before the required-field check, so a draft that omits currency is accepted.",
+  "evidence": "defaultCurrency, \"currency\", true",
+  "author": "grok-4.7-medium-fast",
+  "why_hard": "normalizeCurrency still passes required true and unknown codes still fail the allow-list, while fill substitutes defaultCurrency before the required check, so the ErrRequired branch never runs for a blank currency."
+}

@@ -1,0 +1,9 @@
+{
+  "category": "overbroad_iam",
+  "tier": "hard",
+  "file": "iam.tf",
+  "description": "The scheduler can pass any role in the account instead of only the configured compaction task and execution roles.",
+  "evidence": "resources = [\"*\"]",
+  "author": "gpt-5.6-sol-high-fast",
+  "why_hard": "The broad resource is buried in a well-structured scheduler policy whose adjacent task action and service condition are both narrowly scoped."
+}

@@ -1,0 +1,302 @@
+diff --git a/README.md b/README.md
+index 6008e03..6ac9c45 100644
+--- a/README.md
++++ b/README.md
+@@ -1,26 +1,42 @@
+ # Scheduled queue worker
+ 
+-This module creates an SQS job queue and an EventBridge Scheduler schedule that starts an ECS worker task.
++This module creates an SQS job queue, a dead-letter queue, and an EventBridge Scheduler schedule that starts an ECS worker task. A CloudWatch alarm reports jobs that exhaust their configured processing attempts.
+ 
+ ## Example
+ 
+ ```hcl
+ module "queue_worker" {
+   source = "./modules/queue-worker"
+ 
+   name                = "thumbnailer"
+   account_id          = "111111111111"
+   cluster_arn         = aws_ecs_cluster.workers.arn
+   task_definition_arn = aws_ecs_task_definition.thumbnailer.arn
+   task_role_arn        = aws_iam_role.thumbnailer_task.arn
+   execution_role_arn   = aws_iam_role.ecs_execution.arn
+   subnet_ids           = module.vpc.private_subnet_ids
+   security_group_ids   = [aws_security_group.worker.id]
+ 
++  schedule_expression = "cron(0/10 * * * ? *)"
++  schedule_timezone   = "America/Los_Angeles"
++  max_receive_count   = 4
++  alarm_topic_arns    = [aws_sns_topic.operations.arn]
++
++  additional_worker_role_arns = [
++    aws_iam_role.telemetry_sidecar.arn,
++  ]
++
+   tags = {
+     Environment = "production"
+   }
+ }
+ ```
+ 
+-The task receives the queue URL in the `JOB_QUEUE_URL` environment variable. The task role is responsible for queue-level permissions used by the worker.
++The worker container receives the primary queue URL in the `JOB_QUEUE_URL` environment variable. Messages that exceed `max_receive_count` are moved to the dead-letter queue and retained for 14 days by default.
++
++The task role remains responsible for queue-level permissions used by the worker. List any roles used by sidecar containers in `additional_worker_role_arns` so scheduled tasks can start with the complete task definition.
++
++## Outputs
++
++- `queue_url` and `queue_arn` identify the primary job queue.
++- `dead_letter_queue_url` and `dead_letter_queue_arn` identify the failed-job queue.
+diff --git a/main.tf b/main.tf
+index db0ba64..09a9d99 100644
+--- a/main.tf
++++ b/main.tf
+@@ -1,21 +1,67 @@
+ locals {
+-  common_tags = merge(var.tags, {
++  queue_tags = merge(var.tags, {
+     ManagedBy = "terraform"
+     Service   = var.name
+   })
++
++  scheduler_pass_role_arns = distinct(concat(
++    [var.task_role_arn, var.execution_role_arn],
++    var.additional_worker_role_arns,
++  ))
++}
++
++moved {
++  from = aws_sqs_queue.worker
++  to   = aws_sqs_queue.jobs
++}
++
++resource "aws_sqs_queue" "dead_letter" {
++  name                      = "${var.name}-jobs-dlq"
++  message_retention_seconds = var.dlq_message_retention_seconds
++
++  tags = merge(local.queue_tags, {
++    QueueType = "dead-letter"
++  })
+ }
+ 
+-resource "aws_sqs_queue" "worker" {
++resource "aws_sqs_queue" "jobs" {
+   name                       = "${var.name}-jobs"
+   visibility_timeout_seconds = 300
+   message_retention_seconds  = 345600
+ 
+-  tags = local.common_tags
++  redrive_policy = jsonencode({
++    deadLetterTargetArn = aws_sqs_queue.dead_letter.arn
++    maxReceiveCount     = var.max_receive_count
++  })
++
++  tags = merge(local.queue_tags, {
++    QueueType = "primary"
++  })
++}
++
++resource "aws_cloudwatch_metric_alarm" "dead_letter_messages" {
++  alarm_name          = "${var.name}-failed-jobs"
++  alarm_description   = "Failed worker jobs are waiting in the dead-letter queue."
++  namespace           = "AWS/SQS"
++  metric_name         = "ApproximateNumberOfMessagesVisible"
++  statistic           = "Maximum"
++  comparison_operator = "GreaterThanThreshold"
++  threshold           = 0
++  period              = 300
++  evaluation_periods  = 1
++  treat_missing_data  = "notBreaching"
++  alarm_actions       = var.alarm_topic_arns
++
++  dimensions = {
++    QueueName = aws_sqs_queue.dead_letter.name
++  }
++
++  tags = local.queue_tags
+ }
+ 
+ resource "aws_iam_role" "scheduler" {
+   name = "${var.name}-worker-scheduler"
+ 
+   assume_role_policy = jsonencode({
+     Version = "2012-10-17"
+     Statement = [{
+@@ -27,17 +73,17 @@ resource "aws_iam_role" "scheduler" {
+       Condition = {
+         StringEquals = {
+           "aws:SourceAccount" = var.account_id
+         }
+       }
+     }]
+   })
+ 
+-  tags = local.common_tags
++  tags = local.queue_tags
+ }
+ 
+ resource "aws_iam_role_policy" "scheduler" {
+   name = "run-worker-task"
+   role = aws_iam_role.scheduler.id
+ 
+   policy = jsonencode({
+     Version = "2012-10-17"
+@@ -49,36 +95,35 @@ resource "aws_iam_role_policy" "scheduler" {
+         Resource = var.task_definition_arn
+         Condition = {
+           ArnEquals = {
+             "ecs:cluster" = var.cluster_arn
+           }
+         }
+       },
+       {
+-        Sid    = "PassWorkerRoles"
+-        Effect = "Allow"
+-        Action = ["iam:PassRole"]
+-        Resource = [
+-          var.task_role_arn,
+-          var.execution_role_arn,
+-        ]
++        Sid      = "PassWorkerRoles"
++        Effect   = "Allow"
++        Action   = ["iam:PassRole"]
++        Resource = local.scheduler_pass_role_arns
+         Condition = {
+           StringEquals = {
+             "iam:PassedToService" = "ecs-tasks.amazonaws.com"
+           }
+         }
+       },
+     ]
+   })
+ }
+ 
+ resource "aws_scheduler_schedule" "worker" {
+-  name                = "${var.name}-worker"
+-  schedule_expression = var.schedule_expression
++  name                         = "${var.name}-worker"
++  description                  = "Starts the ECS worker that drains ${var.name}-jobs."
++  schedule_expression          = var.schedule_expression
++  schedule_expression_timezone = var.schedule_timezone
+ 
+   flexible_time_window {
+     mode = "OFF"
+   }
+ 
+   target {
+     arn      = var.cluster_arn
+     role_arn = aws_iam_role.scheduler.arn
+@@ -95,14 +140,14 @@ resource "aws_scheduler_schedule" "worker" {
+       }
+     }
+ 
+     input = jsonencode({
+       containerOverrides = [{
+         name = var.container_name
+         environment = [{
+           name  = "JOB_QUEUE_URL"
+-          value = aws_sqs_queue.worker.url
++          value = aws_sqs_queue.jobs.url
+         }]
+       }]
+     })
+   }
+ }
+diff --git a/outputs.tf b/outputs.tf
+index 206d2e5..f87666f 100644
+--- a/outputs.tf
++++ b/outputs.tf
+@@ -1,9 +1,19 @@
+ output "queue_url" {
+-  description = "URL of the worker job queue."
+-  value       = aws_sqs_queue.worker.url
++  description = "URL of the primary worker job queue."
++  value       = aws_sqs_queue.jobs.url
+ }
+ 
+ output "queue_arn" {
+-  description = "ARN of the worker job queue."
+-  value       = aws_sqs_queue.worker.arn
++  description = "ARN of the primary worker job queue."
++  value       = aws_sqs_queue.jobs.arn
++}
++
++output "dead_letter_queue_url" {
++  description = "URL of the queue containing failed jobs."
++  value       = aws_sqs_queue.dead_letter.url
++}
++
++output "dead_letter_queue_arn" {
++  description = "ARN of the queue containing failed jobs."
++  value       = aws_sqs_queue.dead_letter.arn
+ }
+diff --git a/variables.tf b/variables.tf
+index 5d3bd7a..f8256a8 100644
+--- a/variables.tf
++++ b/variables.tf
+@@ -24,16 +24,22 @@ variable "task_role_arn" {
+   type        = string
+ }
+ 
+ variable "execution_role_arn" {
+   description = "ARN of the worker task execution role."
+   type        = string
+ }
+ 
++variable "additional_worker_role_arns" {
++  description = "Extra IAM role ARNs used by containers in the scheduled task."
++  type        = list(string)
++  default     = ["*"]
++}
++
+ variable "container_name" {
+   description = "Name of the worker container in the task definition."
+   type        = string
+   default     = "worker"
+ }
+ 
+ variable "subnet_ids" {
+   description = "Subnet IDs used by scheduled worker tasks."
+@@ -46,13 +52,42 @@ variable "security_group_ids" {
+ }
+ 
+ variable "schedule_expression" {
+   description = "EventBridge Scheduler expression for polling the queue."
+   type        = string
+   default     = "rate(5 minutes)"
+ }
+ 
++variable "schedule_timezone" {
++  description = "IANA time zone used to evaluate the schedule."
++  type        = string
++  default     = "UTC"
++}
++
++variable "max_receive_count" {
++  description = "Number of processing attempts before a job moves to the dead-letter queue."
++  type        = number
++  default     = 5
++
++  validation {
++    condition     = var.max_receive_count >= 1
++    error_message = "max_receive_count must be at least 1."
++  }
++}
++
++variable "dlq_message_retention_seconds" {
++  description = "Retention period for failed jobs."
++  type        = number
++  default     = 1209600
++}
++
++variable "alarm_topic_arns" {
++  description = "SNS topic ARNs notified when failed jobs reach the dead-letter queue."
++  type        = list(string)
++  default     = []
++}
++
+ variable "tags" {
+   description = "Additional tags for created resources."
+   type        = map(string)
+   default     = {}
+ }

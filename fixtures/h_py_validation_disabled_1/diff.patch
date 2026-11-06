@@ -1,0 +1,409 @@
+diff --git a/hooks/__init__.py b/hooks/__init__.py
+index 767299b..fb3e405 100644
+--- a/hooks/__init__.py
++++ b/hooks/__init__.py
+@@ -1,16 +1,20 @@
+-"""Partner webhook receiver."""
++"""Partner webhook receiver.
++
++``accept`` validates a decoded JSON body and records an idempotent receipt.
++``verify`` checks the HMAC of the raw bytes before the body is decoded.
++"""
+ 
+ from hooks.accept import accept
+ from hooks.errors import SchemaError, SignatureError, WebhookError
+-from hooks.receipts import Receipt, ReceiptLog
++from hooks.receipts import DeliveryLog, Receipt
+ from hooks.sign import verify
+ 
+ __all__ = [
++    "DeliveryLog",
+     "Receipt",
+-    "ReceiptLog",
+     "SchemaError",
+     "SignatureError",
+     "WebhookError",
+     "accept",
+     "verify",
+ ]
+diff --git a/hooks/accept.py b/hooks/accept.py
+index 405dff4..d941ce8 100644
+--- a/hooks/accept.py
++++ b/hooks/accept.py
+@@ -1,26 +1,55 @@
+ """Accept a verified webhook body and record a receipt.
+ 
+ The caller checks the signature before calling ``accept`` and owns the log.
+-This module does not keep process-wide state.
++This module does not keep process-wide state. V1 bodies are flat; v2 bodies
++carry the resource under ``data.object`` and may include a ``request``.
+ """
+ 
+ from __future__ import annotations
+ 
+ from collections.abc import Mapping
+ from typing import Any
+ 
+-from hooks.receipts import Receipt, ReceiptLog
+-from hooks.schema import V1_SCHEMA
++from hooks.receipts import DeliveryLog, Receipt
++from hooks.schema import RESOURCE, V1_SCHEMA, V2_SCHEMA
+ 
+ 
+-def accept(body: Mapping[str, Any], log: ReceiptLog) -> Receipt:
++def accept(body: Mapping[str, Any], log: DeliveryLog) -> Receipt:
+     """Validate ``body`` and store a receipt. A repeated id returns the first copy."""
++    if _is_v2(body):
++        return _accept_v2(body, log)
++    return _accept_v1(body, log)
++
++
++def _is_v2(body: Mapping[str, Any]) -> bool:
++    """V2 deliveries are the ones with an envelope id and a data object."""
++    return isinstance(body, Mapping) and "id" in body and "data" in body
++
++
++def _accept_v1(body: Mapping[str, Any], log: DeliveryLog) -> Receipt:
+     parsed = V1_SCHEMA.validate(body)
+     receipt = Receipt(
+         event_id=parsed["event_id"],
+         event_type=parsed["event_type"],
+         customer_id=parsed["customer_id"],
+         amount_cents=parsed["amount_cents"],
+         created=parsed["created"],
+     )
+     return log.put(receipt)
++
++
++def _accept_v2(body: Mapping[str, Any], log: DeliveryLog) -> Receipt:
++    parsed = V2_SCHEMA.validate(body)
++    resource = RESOURCE.validate(parsed["data"]["object"], reject_unknown=False)
++    request = parsed["request"]
++    attempt = 1 if request is None else request["attempt"]
++    receipt = Receipt(
++        event_id=parsed["id"],
++        event_type=parsed["type"],
++        customer_id=resource["customer"],
++        amount_cents=resource["amount_cents"],
++        created=parsed["created"],
++        api_version=parsed["api_version"],
++        attempt=attempt,
++    )
++    return log.put(receipt)
+diff --git a/hooks/receipts.py b/hooks/receipts.py
+index 083c45b..169326c 100644
+--- a/hooks/receipts.py
++++ b/hooks/receipts.py
+@@ -1,45 +1,44 @@
+ """Idempotent receipt log for accepted webhooks.
+ 
+-A ReceiptLog is owned by the caller. It does not spawn threads and it is not
++A DeliveryLog is owned by the caller. It does not spawn threads and it is not
+ safe to share across threads without external locking.
+ """
+ 
+ from __future__ import annotations
+ 
+-from dataclasses import dataclass
++from dataclasses import dataclass, replace
+ 
+ 
+ @dataclass(frozen=True)
+ class Receipt:
+-    """One accepted delivery."""
++    """One accepted delivery.
++
++    ``attempt`` is the partner delivery counter. Senders that omit it, including
++    every v1 body, are stored with attempt 1. ``duplicate`` is set by the log.
++    """
+ 
+     event_id: str
+     event_type: str
+     customer_id: str
+     amount_cents: int
+     created: int
++    api_version: str = ""
++    attempt: int = 1
+     duplicate: bool = False
+ 
+ 
+-class ReceiptLog:
++class DeliveryLog:
+     """Remembers event ids so a replay does not apply twice."""
+ 
+     def __init__(self) -> None:
+-        self._by_id: dict[str, Receipt] = {}
++        self._receipts: dict[str, Receipt] = {}
+ 
+     def put(self, receipt: Receipt) -> Receipt:
+-        existing = self._by_id.get(receipt.event_id)
++        existing = self._receipts.get(receipt.event_id)
+         if existing is not None:
+-            return Receipt(
+-                event_id=existing.event_id,
+-                event_type=existing.event_type,
+-                customer_id=existing.customer_id,
+-                amount_cents=existing.amount_cents,
+-                created=existing.created,
+-                duplicate=True,
+-            )
+-        self._by_id[receipt.event_id] = receipt
++            return replace(existing, duplicate=True)
++        self._receipts[receipt.event_id] = receipt
+         return receipt
+ 
+     def get(self, event_id: str) -> Receipt | None:
+-        return self._by_id.get(event_id)
++        return self._receipts.get(event_id)
+diff --git a/hooks/schema.py b/hooks/schema.py
+index 95db7c0..80e95ca 100644
+--- a/hooks/schema.py
++++ b/hooks/schema.py
+@@ -31,51 +31,94 @@ class Field:
+ 
+ @dataclass(frozen=True)
+ class ObjectSchema:
+     """A JSON object. Unknown keys fail closed when ``reject_unknown`` is set."""
+ 
+     fields: tuple[Field, ...]
+     reject_unknown: bool = True
+ 
+-    def validate(self, payload: Mapping[str, Any]) -> dict[str, Any]:
++    def validate(
++        self,
++        payload: Mapping[str, Any],
++        *,
++        reject_unknown: bool | None = None,
++    ) -> dict[str, Any]:
+         """Return the schema fields read from ``payload``."""
+         if not isinstance(payload, Mapping):
+             raise SchemaError("body must be an object")
+         known = {field.name: field for field in self.fields}
+-        if self.reject_unknown:
++        reject = self.reject_unknown if reject_unknown is None else reject_unknown
++        if reject:
+             extra = [key for key in payload if key not in known]
+             if extra:
+                 raise SchemaError(f"unknown field {sorted(extra)[0]}")
+         parsed: dict[str, Any] = {}
+         for field in self.fields:
+             parsed[field.name] = _read(field, payload)
+         return parsed
+ 
+ 
+ def _read(field: Field, payload: Mapping[str, Any]) -> Any:
+     if field.name not in payload:
+         if field.required:
+             raise SchemaError(f"missing {field.name}")
+         return field.default
+     value = payload[field.name]
++    if isinstance(field.kind, ObjectSchema):
++        if not isinstance(value, Mapping):
++            raise SchemaError(f"{field.name} must be an object")
++        return field.kind.validate(value)
+     if field.kind is int and isinstance(value, bool):
+         raise SchemaError(f"{field.name} must be an integer")
+     if not isinstance(value, field.kind):
+         raise SchemaError(f"{field.name} has the wrong type")
+     if field.choices and value not in field.choices:
+         raise SchemaError(f"{field.name} is not an allowed value")
+     if field.minimum is not None and isinstance(value, int) and value < field.minimum:
+         raise SchemaError(f"{field.name} is below the minimum")
+     return value
+ 
+ 
+-EVENT_TYPES = ("invoice.created", "invoice.voided")
++EVENT_TYPES = ("invoice.created", "invoice.voided", "invoice.paid", "charge.refunded")
+ 
+ V1_SCHEMA = ObjectSchema(
+     fields=(
+         Field("event_id", str),
+         Field("event_type", str, choices=EVENT_TYPES),
+         Field("customer_id", str),
+         Field("amount_cents", int, minimum=0),
+         Field("created", int, minimum=0),
+     ),
+ )
++
++CURRENCIES = ("usd", "eur")
++
++
++RESOURCE = ObjectSchema(
++    fields=(
++        Field("customer", str),
++        Field("amount_cents", int, minimum=0),
++        Field("currency", str, choices=CURRENCIES),
++    ),
++)
++
++REQUEST = ObjectSchema(
++    fields=(
++        Field("id", str, required=False, default=""),
++        Field("attempt", int, minimum=1),
++    ),
++)
++
++DATA = ObjectSchema(
++    fields=(Field("object", dict),),
++)
++
++V2_SCHEMA = ObjectSchema(
++    fields=(
++        Field("id", str),
++        Field("type", str, choices=EVENT_TYPES),
++        Field("created", int, minimum=0),
++        Field("api_version", str, required=False, default=""),
++        Field("data", DATA),
++        Field("request", REQUEST, required=False, default=None),
++    ),
++)
+diff --git a/tests/test_accept.py b/tests/test_accept.py
+index 40ec501..6f673da 100644
+--- a/tests/test_accept.py
++++ b/tests/test_accept.py
+@@ -1,59 +1,136 @@
+-"""Acceptance tests for flat webhook bodies."""
++"""Acceptance tests for v1 flat bodies and v2 envelopes."""
+ 
+ from __future__ import annotations
+ 
+ import pytest
+ 
+-from hooks.receipts import ReceiptLog
+-from hooks.errors import SchemaError
+ from hooks.accept import accept
++from hooks.errors import SchemaError
++from hooks.receipts import DeliveryLog
+ 
+ 
+ def _body(**overrides: object) -> dict[str, object]:
+     payload: dict[str, object] = {
+         "event_id": "evt_100",
+         "event_type": "invoice.created",
+         "customer_id": "cus_9",
+         "amount_cents": 2500,
+         "created": 1_700_000_000,
+     }
+     payload.update(overrides)
+     return payload
+ 
+ 
+ def test_accepts_invoice_created() -> None:
+-    receipt = accept(_body(), ReceiptLog())
++    receipt = accept(_body(), DeliveryLog())
+     assert receipt.event_id == "evt_100"
+     assert receipt.amount_cents == 2500
+     assert receipt.duplicate is False
+ 
+ 
+ def test_replay_is_duplicate() -> None:
+-    log = ReceiptLog()
++    log = DeliveryLog()
+     first = accept(_body(), log)
+     second = accept(_body(), log)
+     assert first.duplicate is False
+     assert second.duplicate is True
+     assert second.amount_cents == 2500
+ 
+ 
+ def test_rejects_unknown_field() -> None:
+     with pytest.raises(SchemaError):
+-        accept(_body(livemode=True), ReceiptLog())
++        accept(_body(livemode=True), DeliveryLog())
+ 
+ 
+ def test_rejects_missing_amount() -> None:
+     body = _body()
+     del body["amount_cents"]
+     with pytest.raises(SchemaError):
+-        accept(body, ReceiptLog())
++        accept(body, DeliveryLog())
+ 
+ 
+ def test_rejects_negative_amount() -> None:
+     with pytest.raises(SchemaError):
+-        accept(_body(amount_cents=-1), ReceiptLog())
++        accept(_body(amount_cents=-1), DeliveryLog())
+ 
+ 
+ def test_rejects_unknown_event_type() -> None:
+     with pytest.raises(SchemaError):
+-        accept(_body(event_type="customer.deleted"), ReceiptLog())
++        accept(_body(event_type="customer.deleted"), DeliveryLog())
++
++
++@pytest.mark.parametrize("event_type", ["invoice.paid", "charge.refunded"])
++def test_v1_accepts_added_event_types(event_type: str) -> None:
++    receipt = accept(_body(event_type=event_type), DeliveryLog())
++    assert receipt.event_type == event_type
++    assert receipt.attempt == 1
++
++
++def _v2(
++    event_type: str,
++    resource: dict[str, object],
++    **extra: object,
++) -> dict[str, object]:
++    body: dict[str, object] = {
++        "id": "evt_200",
++        "type": event_type,
++        "created": 1_700_000_100,
++        "data": {"object": resource},
++    }
++    body.update(extra)
++    return body
++
++
++def test_v2_invoice_paid_records_attempt_and_version() -> None:
++    resource = {
++        "customer": "cus_9",
++        "amount_cents": 2500,
++        "currency": "usd",
++        "hosted_invoice_url": "https://pay.example/invoices/evt_200",
++        "lines": [{"id": "il_1", "amount": 2500}],
++    }
++    body = _v2(
++        "invoice.paid",
++        resource,
++        api_version="2024-11-01",
++        request={"id": "req_9", "attempt": 2},
++    )
++    receipt = accept(body, DeliveryLog())
++    assert receipt.event_id == "evt_200"
++    assert receipt.customer_id == "cus_9"
++    assert receipt.amount_cents == 2500
++    assert receipt.api_version == "2024-11-01"
++    assert receipt.attempt == 2
++
++
++def test_v2_charge_refunded_defaults_attempt_when_request_absent() -> None:
++    resource = {
++        "customer": "cus_3",
++        "amount_cents": 500,
++        "currency": "eur",
++        "balance_transaction": "txn_44",
++        "reason": "requested_by_customer",
++    }
++    receipt = accept(
++        _v2("charge.refunded", resource, id="evt_201", created=1_700_000_200),
++        DeliveryLog(),
++    )
++    assert receipt.event_type == "charge.refunded"
++    assert receipt.amount_cents == 500
++    assert receipt.customer_id == "cus_3"
++    assert receipt.attempt == 1
++    assert receipt.api_version == ""
++
++
++def test_v2_rejects_unknown_data_member() -> None:
++    body = {
++        "id": "evt_204",
++        "type": "invoice.paid",
++        "created": 1_700_000_100,
++        "data": {
++            "object": {"customer": "cus_9", "amount_cents": 10, "currency": "usd"},
++            "previous_attributes": {"amount_cents": 0},
++        },
++    }
++    with pytest.raises(SchemaError):
++        accept(body, DeliveryLog())

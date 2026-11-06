@@ -1,0 +1,9 @@
+{
+  "category": "unrelated_deletion",
+  "tier": "hard",
+  "file": "billing/ledger.py",
+  "description": "issue() no longer stops a series once next_no passes ceiling, so later invoices are numbered past the series limit.",
+  "evidence": "series.next_no > series.ceiling",
+  "author": "grok-4.7-medium-fast",
+  "why_hard": "add_series still rejects a series that already starts past its ceiling, and issue() still raises when the series is not accepting, so dropping the next_no comparison reads as a reflow of that flag beside the posted_by parameter."
+}

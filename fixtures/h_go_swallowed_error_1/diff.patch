@@ -1,0 +1,276 @@
+diff --git a/pipeline/event.go b/pipeline/event.go
+index 18edf29..27ad0d3 100644
+--- a/pipeline/event.go
++++ b/pipeline/event.go
+@@ -1,10 +1,18 @@
+ package pipeline
+ 
+ import "time"
+ 
+-type metricPoint struct {
++// Sample is a metric measurement accepted by the pipeline.
++type Sample struct {
+ 	Name   string
+ 	Value  float64
+ 	Labels map[string]string
+ 	At     time.Time
+ }
++
++// AuditEntry describes the ingestion of a metric sample.
++type AuditEntry struct {
++	Action     string
++	MetricName string
++	OccurredAt time.Time
++}
+diff --git a/pipeline/memory.go b/pipeline/memory.go
+index e2a4e0f..c6d5ed0 100644
+--- a/pipeline/memory.go
++++ b/pipeline/memory.go
+@@ -1,29 +1,60 @@
+ package pipeline
+ 
+ import (
+ 	"context"
+ 	"sync"
+ )
+ 
+ type MemoryRecorder struct {
+-	mu     sync.Mutex
+-	points []metricPoint
++	mu      sync.Mutex
++	samples []Sample
+ }
+ 
+-func (r *MemoryRecorder) Record(ctx context.Context, point metricPoint) error {
++func (r *MemoryRecorder) Record(ctx context.Context, sample Sample) error {
+ 	if err := ctx.Err(); err != nil {
+ 		return err
+ 	}
+ 	r.mu.Lock()
+ 	defer r.mu.Unlock()
+-	r.points = append(r.points, point)
++	r.samples = append(r.samples, sample)
+ 	return nil
+ }
+ 
+-func (r *MemoryRecorder) Points() []metricPoint {
++func (r *MemoryRecorder) Flush(ctx context.Context) error {
++	return ctx.Err()
++}
++
++func (r *MemoryRecorder) Samples() []Sample {
+ 	r.mu.Lock()
+ 	defer r.mu.Unlock()
+-	points := make([]metricPoint, len(r.points))
+-	copy(points, r.points)
+-	return points
++	samples := make([]Sample, len(r.samples))
++	copy(samples, r.samples)
++	return samples
++}
++
++type MemoryAuditSink struct {
++	mu      sync.Mutex
++	entries []AuditEntry
++}
++
++func (s *MemoryAuditSink) Append(ctx context.Context, entry AuditEntry) error {
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	s.entries = append(s.entries, entry)
++	return nil
++}
++
++func (s *MemoryAuditSink) Flush(ctx context.Context) error {
++	return ctx.Err()
++}
++
++func (s *MemoryAuditSink) Entries() []AuditEntry {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	entries := make([]AuditEntry, len(s.entries))
++	copy(entries, s.entries)
++	return entries
+ }
+diff --git a/pipeline/pipeline.go b/pipeline/pipeline.go
+index b7362f8..29a19e2 100644
+--- a/pipeline/pipeline.go
++++ b/pipeline/pipeline.go
+@@ -1,27 +1,61 @@
+ package pipeline
+ 
+ import (
+ 	"context"
+ 	"fmt"
++	"log/slog"
+ 	"time"
+ )
+ 
+ type Recorder interface {
+-	Record(context.Context, metricPoint) error
++	Record(context.Context, Sample) error
++	Flush(context.Context) error
++}
++
++type AuditSink interface {
++	Append(context.Context, AuditEntry) error
++	Flush(context.Context) error
+ }
+ 
+ type Pipeline struct {
+ 	recorder Recorder
++	audit    AuditSink
++	log      *slog.Logger
+ }
+ 
+-func New(recorder Recorder) *Pipeline {
+-	return &Pipeline{recorder: recorder}
++func New(recorder Recorder, audit AuditSink, logger *slog.Logger) *Pipeline {
++	return &Pipeline{recorder: recorder, audit: audit, log: logger}
+ }
+ 
+ func (p *Pipeline) Observe(ctx context.Context, name string, value float64, labels map[string]string) error {
+-	point := metricPoint{Name: name, Value: value, Labels: labels, At: time.Now().UTC()}
+-	if err := p.recorder.Record(ctx, point); err != nil {
++	now := time.Now().UTC()
++	sample := Sample{Name: name, Value: value, Labels: cloneLabels(labels), At: now}
++	if err := p.recorder.Record(ctx, sample); err != nil {
+ 		return fmt.Errorf("record metric %q: %w", name, err)
+ 	}
++
++	entry := AuditEntry{Action: "metric.recorded", MetricName: name, OccurredAt: now}
++	if err := p.audit.Append(ctx, entry); err != nil {
++		return fmt.Errorf("append audit entry for %q: %w", name, err)
++	}
++	return nil
++}
++
++func (p *Pipeline) Flush(ctx context.Context) error {
++	if err := p.recorder.Flush(ctx); err != nil {
++		return fmt.Errorf("flush metrics: %w", err)
++	}
++	if err := p.audit.Flush(ctx); err != nil {
++		p.log.Debug("audit flush did not complete", "error", err)
++		return nil
++	}
+ 	return nil
+ }
++
++func cloneLabels(labels map[string]string) map[string]string {
++	cloned := make(map[string]string, len(labels))
++	for key, value := range labels {
++		cloned[key] = value
++	}
++	return cloned
++}
+diff --git a/pipeline/pipeline_test.go b/pipeline/pipeline_test.go
+index 264d015..ee33dd1 100644
+--- a/pipeline/pipeline_test.go
++++ b/pipeline/pipeline_test.go
+@@ -1,41 +1,89 @@
+ package pipeline
+ 
+ import (
+ 	"context"
+ 	"errors"
++	"io"
++	"log/slog"
+ 	"testing"
+ )
+ 
+-type failingRecorder struct {
+-	err error
++type stubRecorder struct {
++	recordErr error
++	flushErr  error
+ }
+ 
+-func (r failingRecorder) Record(context.Context, metricPoint) error {
+-	return r.err
++func (r stubRecorder) Record(context.Context, Sample) error { return r.recordErr }
++func (r stubRecorder) Flush(context.Context) error          { return r.flushErr }
++
++type stubAuditSink struct {
++	appendErr error
++	flushErr  error
++}
++
++func (s stubAuditSink) Append(context.Context, AuditEntry) error { return s.appendErr }
++func (s stubAuditSink) Flush(context.Context) error              { return s.flushErr }
++
++func discardLogger() *slog.Logger {
++	return slog.New(slog.NewTextHandler(io.Discard, nil))
+ }
+ 
+-func TestObserveRecordsMetric(t *testing.T) {
++func TestObserveRecordsMetricAndAuditEntry(t *testing.T) {
+ 	recorder := &MemoryRecorder{}
+-	p := New(recorder)
++	audit := &MemoryAuditSink{}
++	p := New(recorder, audit, discardLogger())
++	labels := map[string]string{"queue": "fast"}
+ 
+-	if err := p.Observe(context.Background(), "jobs.completed", 3, map[string]string{"queue": "fast"}); err != nil {
++	if err := p.Observe(context.Background(), "jobs.completed", 3, labels); err != nil {
+ 		t.Fatalf("Observe() error = %v", err)
+ 	}
++	labels["queue"] = "changed"
++
++	samples := recorder.Samples()
++	if len(samples) != 1 {
++		t.Fatalf("len(samples) = %d, want 1", len(samples))
++	}
++	if samples[0].Name != "jobs.completed" || samples[0].Value != 3 {
++		t.Fatalf("sample = %#v", samples[0])
++	}
++	if samples[0].Labels["queue"] != "fast" {
++		t.Fatalf("stored labels = %#v", samples[0].Labels)
++	}
+ 
+-	points := recorder.Points()
+-	if len(points) != 1 {
+-		t.Fatalf("len(points) = %d, want 1", len(points))
++	entries := audit.Entries()
++	if len(entries) != 1 {
++		t.Fatalf("len(entries) = %d, want 1", len(entries))
++	}
++	if entries[0].Action != "metric.recorded" || entries[0].MetricName != "jobs.completed" {
++		t.Fatalf("entry = %#v", entries[0])
+ 	}
+-	if points[0].Name != "jobs.completed" || points[0].Value != 3 {
+-		t.Fatalf("point = %#v", points[0])
++	if !entries[0].OccurredAt.Equal(samples[0].At) {
++		t.Fatalf("audit time %v differs from sample time %v", entries[0].OccurredAt, samples[0].At)
+ 	}
+ }
+ 
+-func TestObserveReportsRecorderFailure(t *testing.T) {
+-	p := New(failingRecorder{err: errors.New("offline")})
++func TestObserveReportsAuditAppendFailure(t *testing.T) {
++	p := New(
++		&MemoryRecorder{},
++		stubAuditSink{appendErr: errors.New("audit unavailable")},
++		discardLogger(),
++	)
+ 
+ 	err := p.Observe(context.Background(), "jobs.completed", 1, nil)
+ 	if err == nil {
+ 		t.Fatal("Observe() error = nil")
+ 	}
+ }
++
++func TestFlushReportsRecorderFailure(t *testing.T) {
++	p := New(
++		stubRecorder{flushErr: errors.New("metrics unavailable")},
++		stubAuditSink{},
++		discardLogger(),
++	)
++
++	err := p.Flush(context.Background())
++	if err == nil {
++		t.Fatal("Flush() error = nil")
++	}
++}

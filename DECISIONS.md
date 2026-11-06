@@ -108,3 +108,10 @@ Autonomous run. Each entry: what was decided, why, and how to reverse it.
 - D-31 Authoring settings were medium-fast/high-fast, not xhigh (see D-28). Fixtures were authored
   by Grok and OpenAI models, so family effects remain possible; the first hard-tier pilot is
   in-sample calibration.
+- D-32 Step-5 cross-review (diff included the 32 fixtures, truncated to 60k of ~1.09M chars, so
+  mostly the fixtures' beginnings were seen; code under review was largely NOT covered). Fixed:
+  stderr cap checked after exit; timeout kills the whole process group (new session + killpg);
+  default author models set to the ones that finish; report chart title follows the selected
+  tier. Disagreed and not changed: thread-safety / unbounded message size / panic-in-metrics
+  hardening of the CLEAN fixtures (h_clean_py_3, h_clean_go_1): the tasks do not ask for it, and
+  hardening beyond the task would make controls synthetic.

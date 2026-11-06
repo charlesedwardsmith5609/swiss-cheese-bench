@@ -1,0 +1,9 @@
+{
+  "category": "swallowed_error",
+  "tier": "hard",
+  "file": "notification/dispatcher.py",
+  "description": "Transport exceptions are converted into synthetic delivery receipts, so callers cannot distinguish failed submissions from successful ones.",
+  "evidence": "        except Exception:",
+  "author": "gpt-5.6-sol-high-fast",
+  "why_hard": "The synthetic provider identifier and debug logging resemble intentional resilience behavior and are buried inside a helper added alongside a transport API migration, batching, validation, and receipt renaming."
+}

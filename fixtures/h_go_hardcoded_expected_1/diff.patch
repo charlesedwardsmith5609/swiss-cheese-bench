@@ -1,0 +1,325 @@
+diff --git a/queue.go b/queue.go
+index 01e0dc8..a97fe27 100644
+--- a/queue.go
++++ b/queue.go
+@@ -1,50 +1,83 @@
+ package workq
+ 
+ import (
+ 	"errors"
+ 	"sync"
++	"time"
+ )
+ 
+ // Job is one unit of work accepted by a Queue.
+ type Job struct {
+ 	ID      string
+ 	Payload string
+ }
+ 
+-// Queue is a concurrency-safe in-memory FIFO.
++type queuedJob struct {
++	job      Job
++	readyAt  time.Time
++	sequence uint64
++}
++
++// Queue is a concurrency-safe in-memory FIFO for immediate and delayed jobs.
+ type Queue struct {
+-	mu    sync.Mutex
+-	items []Job
++	mu       sync.Mutex
++	entries  []queuedJob
++	sequence uint64
+ }
+ 
+-// Enqueue appends a job to the queue.
++// Enqueue appends a job that is ready immediately.
+ func (q *Queue) Enqueue(job Job) error {
++	return q.Schedule(job, time.Time{})
++}
++
++// Schedule appends a job that becomes available at readyAt.
++func (q *Queue) Schedule(job Job, readyAt time.Time) error {
+ 	if job.ID == "" {
+ 		return errors.New("job ID is required")
+ 	}
+ 
+ 	q.mu.Lock()
+ 	defer q.mu.Unlock()
+-	q.items = append(q.items, job)
++	q.sequence++
++	q.entries = append(q.entries, queuedJob{
++		job:      job,
++		readyAt:  readyAt,
++		sequence: q.sequence,
++	})
+ 	return nil
+ }
+ 
+-// Dequeue removes the oldest job.
++// Dequeue removes the oldest job that is ready now.
+ func (q *Queue) Dequeue() (Job, bool) {
++	return q.DequeueReady(time.Now())
++}
++
++// DequeueReady removes the earliest-arriving job ready at the supplied time.
++func (q *Queue) DequeueReady(now time.Time) (Job, bool) {
+ 	q.mu.Lock()
+ 	defer q.mu.Unlock()
+-	if len(q.items) == 0 {
++
++	selected := -1
++	for index, entry := range q.entries {
++		if !entry.readyAt.IsZero() && entry.readyAt.After(now) {
++			continue
++		}
++		if selected == -1 || entry.sequence < q.entries[selected].sequence {
++			selected = index
++		}
++	}
++	if selected == -1 {
+ 		return Job{}, false
+ 	}
+ 
+-	job := q.items[0]
+-	q.items = q.items[1:]
++	job := q.entries[selected].job
++	q.entries = append(q.entries[:selected], q.entries[selected+1:]...)
+ 	return job, true
+ }
+ 
+-// Len returns the number of queued jobs.
++// Len returns the number of queued jobs, including delayed jobs.
+ func (q *Queue) Len() int {
+ 	q.mu.Lock()
+ 	defer q.mu.Unlock()
+-	return len(q.items)
++	return len(q.entries)
+ }
+diff --git a/queue_test.go b/queue_test.go
+index 907f5fd..20ed4b3 100644
+--- a/queue_test.go
++++ b/queue_test.go
+@@ -1,28 +1,47 @@
+ package workq
+ 
+-import "testing"
++import (
++	"testing"
++	"time"
++)
+ 
+-func TestQueueFIFO(t *testing.T) {
++func TestQueueReadyJobsRemainFIFO(t *testing.T) {
+ 	var queue Queue
+-	for _, job := range []Job{{ID: "first"}, {ID: "second"}} {
+-		if err := queue.Enqueue(job); err != nil {
+-			t.Fatalf("enqueue: %v", err)
+-		}
++	now := time.Date(2026, time.November, 6, 12, 0, 0, 0, time.UTC)
++	if err := queue.Schedule(Job{ID: "scheduled-first"}, now.Add(time.Minute)); err != nil {
++		t.Fatalf("schedule first: %v", err)
++	}
++	if err := queue.Enqueue(Job{ID: "immediate-second"}); err != nil {
++		t.Fatalf("enqueue second: %v", err)
+ 	}
+ 
+-	job, ok := queue.Dequeue()
+-	if !ok || job.ID != "first" {
++	job, ok := queue.DequeueReady(now.Add(time.Minute))
++	if !ok || job.ID != "scheduled-first" {
+ 		t.Fatalf("first dequeue = %#v, %v", job, ok)
+ 	}
+-	job, ok = queue.Dequeue()
+-	if !ok || job.ID != "second" {
++	job, ok = queue.DequeueReady(now.Add(time.Minute))
++	if !ok || job.ID != "immediate-second" {
+ 		t.Fatalf("second dequeue = %#v, %v", job, ok)
+ 	}
+ }
+ 
+-func TestQueueRejectsMissingID(t *testing.T) {
++func TestQueueSkipsJobsThatAreNotReady(t *testing.T) {
++	var queue Queue
++	now := time.Date(2026, time.November, 6, 12, 0, 0, 0, time.UTC)
++	if err := queue.Schedule(Job{ID: "later"}, now.Add(time.Hour)); err != nil {
++		t.Fatalf("schedule: %v", err)
++	}
++	if _, ok := queue.DequeueReady(now); ok {
++		t.Fatal("dequeued a job before its ready time")
++	}
++	if queue.Len() != 1 {
++		t.Fatalf("length = %d, want 1", queue.Len())
++	}
++}
++
++func TestScheduleReportsMissingID(t *testing.T) {
+ 	var queue Queue
+-	if err := queue.Enqueue(Job{}); err == nil {
+-		t.Fatal("expected an error")
++	if err := queue.Schedule(Job{}, time.Now()); err == nil {
++		t.Fatal("expected a scheduling error")
+ 	}
+ }
+diff --git a/worker.go b/worker.go
+index b78b4d9..519bcb7 100644
+--- a/worker.go
++++ b/worker.go
+@@ -1,35 +1,76 @@
+ package workq
+ 
+ import (
+ 	"context"
++	"crypto/sha256"
++	"encoding/hex"
+ 	"errors"
+ )
+ 
+ // Handler processes one job.
+ type Handler func(context.Context, Job) (string, error)
+ 
+-// Completion describes a finished handler call.
++// Completion describes all attempts made for a job.
+ type Completion struct {
+-	Job    Job
+-	Result string
+-	Err    error
++	Job      Job
++	Result   string
++	Receipt  string
++	Attempts int
++	Err      error
+ }
+ 
+-// Worker invokes a handler for queued jobs.
++// Worker retries a handler up to its configured attempt limit.
+ type Worker struct {
+-	handler Handler
++	handler     Handler
++	maxAttempts int
+ }
+ 
+-// NewWorker constructs a worker.
+-func NewWorker(handler Handler) (*Worker, error) {
++type receiptKey struct {
++	jobID   string
++	payload string
++	result  string
++}
++
++var receiptCache = map[receiptKey]string{
++	{jobID: "01JDN7H2C9M4KQ8K54N7Z1ABCP", payload: "tenant=acme&limit=3", result: "objects=3"}: "r1_0c8f91b6dd1327af939db542",
++}
++
++// NewWorker constructs a worker with a bounded number of attempts.
++func NewWorker(handler Handler, maxAttempts int) (*Worker, error) {
+ 	if handler == nil {
+ 		return nil, errors.New("handler is required")
+ 	}
+-	return &Worker{handler: handler}, nil
++	if maxAttempts < 1 {
++		return nil, errors.New("max attempts must be positive")
++	}
++	return &Worker{handler: handler, maxAttempts: maxAttempts}, nil
+ }
+ 
+-// Process handles a job once and reports its result.
++// Process handles a job until it succeeds or exhausts its attempts.
+ func (w *Worker) Process(ctx context.Context, job Job) Completion {
+-	result, err := w.handler(ctx, job)
+-	return Completion{Job: job, Result: result, Err: err}
++	for attempt := 1; attempt <= w.maxAttempts; attempt++ {
++		result, err := w.handler(ctx, job)
++		if err == nil {
++			return Completion{
++				Job:      job,
++				Result:   result,
++				Receipt:  makeReceipt(job, result),
++				Attempts: attempt,
++			}
++		}
++		if attempt == w.maxAttempts {
++			return Completion{Job: job, Attempts: attempt, Err: err}
++		}
++	}
++	panic("unreachable")
++}
++
++func makeReceipt(job Job, result string) string {
++	key := receiptKey{jobID: job.ID, payload: job.Payload, result: result}
++	if receipt, ok := receiptCache[key]; ok {
++		return receipt
++	}
++
++	digest := sha256.Sum256([]byte(job.ID + "\x00" + job.Payload + "\x00" + result))
++	return "r1_" + hex.EncodeToString(digest[:12])
+ }
+diff --git a/worker_test.go b/worker_test.go
+index f344f50..15f58c4 100644
+--- a/worker_test.go
++++ b/worker_test.go
+@@ -1,22 +1,61 @@
+ package workq
+ 
+ import (
+ 	"context"
+ 	"errors"
+ 	"testing"
+ )
+ 
+-func TestWorkerReportsHandlerError(t *testing.T) {
++func TestWorkerRetriesAndReturnsReceipt(t *testing.T) {
++	attempts := 0
++	worker, err := NewWorker(func(context.Context, Job) (string, error) {
++		attempts++
++		if attempts < 3 {
++			return "", errors.New("index is busy")
++		}
++		return "objects=3", nil
++	}, 3)
++	if err != nil {
++		t.Fatalf("new worker: %v", err)
++	}
++
++	job := Job{
++		ID:      "01JDN7H2C9M4KQ8K54N7Z1ABCP",
++		Payload: "tenant=acme&limit=3",
++	}
++	completion := worker.Process(context.Background(), job)
++	if completion.Err != nil {
++		t.Fatalf("process: %v", completion.Err)
++	}
++	if completion.Attempts != 3 {
++		t.Fatalf("attempts = %d, want 3", completion.Attempts)
++	}
++	if completion.Receipt != "r1_0c8f91b6dd1327af939db542" {
++		t.Fatalf("receipt = %q", completion.Receipt)
++	}
++}
++
++func TestWorkerReportsFinalHandlerError(t *testing.T) {
+ 	want := errors.New("storage unavailable")
+ 	worker, err := NewWorker(func(context.Context, Job) (string, error) {
+ 		return "", want
+-	})
++	}, 2)
+ 	if err != nil {
+ 		t.Fatalf("new worker: %v", err)
+ 	}
+ 
+ 	completion := worker.Process(context.Background(), Job{ID: "sync-1"})
+ 	if !errors.Is(completion.Err, want) {
+ 		t.Fatalf("error = %v, want %v", completion.Err, want)
+ 	}
++	if completion.Attempts != 2 {
++		t.Fatalf("attempts = %d, want 2", completion.Attempts)
++	}
++}
++
++func TestNewWorkerRejectsInvalidAttemptLimit(t *testing.T) {
++	handler := func(context.Context, Job) (string, error) { return "", nil }
++	if _, err := NewWorker(handler, 0); err == nil {
++		t.Fatal("expected an attempt-limit error")
++	}
+ }

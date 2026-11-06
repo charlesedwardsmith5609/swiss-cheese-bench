@@ -1,0 +1,5 @@
+{
+  "id": "h_py_dropped_requirement_1",
+  "language": "python",
+  "task": "Add a synchronous worker that drains the in-memory job queue one job at a time; the caller owns the store and invokes the worker. Requirements: claim_next grants an exclusive lease of lease_seconds and must not return that job again until the lease expires; enqueue accepts a not_before unix time, and claim_next must skip the job while now is still before that instant, whether or not backoff would allow it; when the handler raises, the failure is counted and the job stays out of claim_next until now reaches available_at, computed as base_delay * 2 ** (attempts - 1) seconds after the failure, with base_delay defaulting to 2; when attempts reaches max_attempts (default 5) the job is appended to the dead-letter list and never claimed again; when the handler returns, the job is acknowledged, removed from the runnable set, and recorded in a completion entry whose attempts field equals the number of failures recorded for that job. Rename Job.payload to Job.body and refresh the module docstrings to match the worker."
+}

@@ -1,0 +1,5 @@
+{
+  "id": "h_go_dropped_requirement_1",
+  "language": "go",
+  "task": "Extend the directory-backed object store that backs the upload API. Put must reject an empty body with ErrEmptyObject and a body larger than MaxBytes (8 MiB) with ErrTooLarge, without leaving a new object or replacing an existing one, and it must accept only the content types image/jpeg, image/png, and application/pdf, returning ErrUnsupportedType for a missing or any other type. On success, persist a lowercase hex SHA-256 of the stored bytes and return that digest from Put and from Stat together with the content type and size. Replacement must be atomic: readers of the key keep observing the previous bytes, content type, and digest until the new object is renamed into place. When contentLength is zero or positive, Put must fail without replacing an existing object if that value is not exactly the number of bytes read; contentLength -1 means the upload had no Content-Length header."
+}

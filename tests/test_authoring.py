@@ -235,3 +235,48 @@ def test_prompt_includes_audit_note_only_when_given() -> None:
     noted = authoring.build_prompt(CELL, "EX", note="FIFO order is wrong")
     assert "audit of an earlier attempt" not in plain
     assert "FIFO order is wrong" in noted and "exactly the one seeded defect" in noted
+
+
+def _alive(pid: int) -> bool:
+    import os
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def test_timeout_kills_the_whole_process_group(tmp_path: Path) -> None:
+    import time
+
+    pidfile = tmp_path / "child.pid"
+    agent = fake_agent(
+        tmp_path,
+        f"""
+import subprocess
+child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])
+open({str(pidfile)!r}, 'w').write(str(child.pid))
+time.sleep(120)
+""",
+    )
+    with pytest.raises(AuthoringError, match="timed out"):
+        run_agent("p", "m", tmp_path / "w", agent, timeout_s=2)
+    child_pid = int(pidfile.read_text())
+    deadline = time.monotonic() + 10
+    while _alive(child_pid) and time.monotonic() < deadline:
+        time.sleep(0.05)  # bounded poll for the killed grandchild to be reaped by init
+    assert not _alive(child_pid)
+
+
+def test_stderr_flood_after_exit_is_rejected(tmp_path: Path) -> None:
+    agent = fake_agent(tmp_path, "sys.stderr.write('x' * 500_000); print('ok')")
+    with pytest.raises(AuthoringError, match="size cap"):
+        run_agent("p", "m", tmp_path / "w", agent, timeout_s=20, max_bytes=100_000)
+
+
+def test_default_author_models_are_the_ones_that_finish() -> None:
+    assert authoring.AUTHOR_MODELS == {
+        "grok": "grok-4.7-medium-fast",
+        "gpt": "gpt-5.6-sol-high-fast",
+    }

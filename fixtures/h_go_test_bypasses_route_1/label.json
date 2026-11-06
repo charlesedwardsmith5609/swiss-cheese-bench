@@ -1,0 +1,9 @@
+{
+  "category": "test_bypasses_route",
+  "tier": "hard",
+  "file": "internal/httpapi/server_test.go",
+  "description": "The operator purge test calls the purge handler directly, so the bearer token never passes through the DELETE route's auth middleware.",
+  "evidence": "http.HandlerFunc(h.api.purge).ServeHTTP(rr, req)",
+  "author": "grok-4.7-medium-fast",
+  "why_hard": "The assertion stays green because Purge rejects a context with no principal, and the following GET still goes through the test server, which hides that this denial never enters the DELETE route."
+}

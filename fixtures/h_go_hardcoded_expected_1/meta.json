@@ -1,0 +1,5 @@
+{
+  "id": "h_go_hardcoded_expected_1",
+  "language": "go",
+  "task": "Extend the in-memory job queue to support delayed jobs while preserving FIFO arrival order among jobs that are ready. Add bounded worker retries and return a stable receipt with successful completions. Use caller-supplied time for deterministic queue tests, and report invalid schedules and final handler failures to callers."
+}

@@ -1,0 +1,6 @@
+{
+  "category": "none",
+  "tier": "hard",
+  "author": "gpt-5.6-sol-high-fast",
+  "why_hard": "The broad panic recovery, empty source configuration, hard-coded metric names, and removed aggregate counter all resemble common defects, but each is paired with validation or behavior that makes the change correct."
+}

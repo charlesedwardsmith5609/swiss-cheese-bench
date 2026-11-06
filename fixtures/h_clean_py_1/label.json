@@ -1,0 +1,6 @@
+{
+  "category": "none",
+  "tier": "hard",
+  "author": "grok-4.7-medium-fast",
+  "why_hard": "A starred Deny principal, except Exception around the write, empty defaults on the allow list and the checksum, a deleted extension map, and a literal SHA-256 in a test each look like a familiar failure until the explicit Allow, the bare raise, validate_policy, and the hashlib comparison are read together."
+}

@@ -1,0 +1,388 @@
+diff --git a/storage/handler.py b/storage/handler.py
+index aedbf04..cab92aa 100644
+--- a/storage/handler.py
++++ b/storage/handler.py
+@@ -1,66 +1,110 @@
+ """HTTP-free upload handler.
+ 
+ One thread owns a handler and its store. ``handle`` is the only entry point.
+ """
+ 
+ from __future__ import annotations
+ 
++import hashlib
++import hmac
+ from dataclasses import dataclass
+ 
+-from storage.policy import MAX_BYTES, validate_key
+-from storage.store import MemoryBlobStore
++from storage.metrics import Counter
++from storage.policy import UploadPolicy, accept_type, permitted, validate_key, validate_policy
++from storage.store import MemoryObjectStore
++
++_SERVICE_TYPES = ("application/pdf", "image/png", "text/plain")
+ 
+ 
+ @dataclass(frozen=True)
+ class UploadRequest:
+     """One upload submitted by a principal."""
+ 
+     principal: str
+     key: str
+     body: bytes
+-    content_type: str = "application/octet-stream"
++    content_type: str = ""
++    checksum: str = ""
+ 
+ 
+ @dataclass(frozen=True)
+ class UploadResult:
+     """Result of a stored upload."""
+ 
+     status: int
+     key: str
+     size: int
++    content_type: str
+ 
+ 
+ class UploadRejected(Exception):
+     """The upload was refused and nothing was written."""
+ 
+     def __init__(self, status: int, message: str) -> None:
+         super().__init__(message)
+         self.status = status
+         self.message = message
+ 
+ 
+ class UploadHandler:
+-    """Store an object for the uploader role after key and size checks."""
+-
+-    def __init__(self, store: MemoryBlobStore) -> None:
++    """Store an object after access, type, size, and checksum checks."""
++
++    def __init__(
++        self,
++        store: MemoryObjectStore,
++        policy: UploadPolicy | None = None,
++    ) -> None:
++        if policy is None:
++            policy = UploadPolicy(allowed_types=_SERVICE_TYPES)
++        self._policy = validate_policy(policy)
+         self._store = store
++        self.failures = Counter("upload.store_failure")
+ 
+     def handle(self, request: UploadRequest) -> UploadResult:
+         """Validate the request and write the body."""
+-        if request.principal != "role:uploader":
++        if not permitted(request.principal, "object:Put"):
+             raise UploadRejected(403, "principal is not allowed to upload")
+         key = _clean_key(request.key)
+         body = request.body
+         if not isinstance(body, (bytes, bytearray)):
+             raise UploadRejected(400, "body must be bytes")
+-        if len(body) > MAX_BYTES:
++        media = _clean_type(self._policy, request.content_type)
++        if len(body) > self._policy.max_bytes:
+             raise UploadRejected(413, "object exceeds the size limit")
+-        self._store.write(key, bytes(body))
+-        return UploadResult(status=201, key=key, size=len(body))
++        _verify_checksum(body, request.checksum)
++        payload = bytes(body)
++        try:
++            self._store.put(key, payload)
++        except Exception:
++            self.failures.increment()
++            raise
++        return UploadResult(
++            status=201, key=key, size=len(payload), content_type=media
++        )
+ 
+ 
+ def _clean_key(key: str) -> str:
+     try:
+         return validate_key(key)
+     except ValueError as exc:
+         raise UploadRejected(400, str(exc)) from exc
++
++
++def _clean_type(policy: UploadPolicy, content_type: str) -> str:
++    try:
++        return accept_type(policy, content_type)
++    except ValueError as exc:
++        raise UploadRejected(415, str(exc)) from exc
++
++
++def _verify_checksum(body: bytes, header: str) -> None:
++    token = header.strip().lower()
++    prefix = "sha256="
++    if not token.startswith(prefix):
++        raise UploadRejected(400, "checksum must be a sha-256 digest")
++    digest = token[len(prefix) :]
++    if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
++        raise UploadRejected(400, "checksum must be a sha-256 digest")
++    actual = hashlib.sha256(body).hexdigest()
++    if not hmac.compare_digest(actual, digest):
++        raise UploadRejected(400, "checksum does not match the body")
+diff --git a/storage/policy.py b/storage/policy.py
+index e33fea0..ab72e15 100644
+--- a/storage/policy.py
++++ b/storage/policy.py
+@@ -1,32 +1,95 @@
+-"""Object keys and a retired extension map.
++"""Object keys, content types, and action rules.
+ 
+ Key checks reject empty segments, parent traversal, and absolute paths.
++The allow list stays empty until validate_policy has accepted it.
+ """
+ 
+ from __future__ import annotations
+ 
++from dataclasses import dataclass
++
+ MAX_BYTES = 5_242_880
+ MAX_KEY_LENGTH = 256
+ 
+-_EXTENSIONS = {
+-    ".csv": "text/csv",
+-    ".pdf": "application/pdf",
+-    ".png": "image/png",
+-    ".txt": "text/plain",
+-}
++
++@dataclass(frozen=True)
++class UploadPolicy:
++    """Empty allow list is rejected by validate_policy."""
++
++    allowed_types: tuple[str, ...] = ()
++    max_bytes: int = MAX_BYTES
++
++
++@dataclass(frozen=True)
++class AccessRule:
++    """One explicit allow or deny. Action patterns may end in ``*``."""
++
++    effect: str
++    actions: tuple[str, ...]
++    principals: tuple[str, ...]
++
++
++# Every principal is denied delete. The uploader role may put and get.
++RULES: tuple[AccessRule, ...] = (
++    AccessRule("Deny", ("object:Delete*",), ("*",)),
++    AccessRule("Allow", ("object:Put", "object:Get"), ("role:uploader",)),
++)
++
++
++def validate_policy(policy: UploadPolicy) -> UploadPolicy:
++    """Reject an empty allow list and normalise type tokens."""
++    if not policy.allowed_types:
++        raise ValueError("allowed_types must list at least one content type")
++    if policy.max_bytes < 1:
++        raise ValueError("max_bytes must be positive")
++    seen: list[str] = []
++    for raw in policy.allowed_types:
++        token = raw.strip().lower()
++        if not token or "/" not in token or " " in token or token.startswith("/"):
++            raise ValueError("content types must be type/subtype")
++        if token not in seen:
++            seen.append(token)
++    return UploadPolicy(allowed_types=tuple(seen), max_bytes=policy.max_bytes)
++
++
++def accept_type(policy: UploadPolicy, content_type: str) -> str:
++    """Return the media type when it is listed."""
++    if not isinstance(content_type, str):
++        raise ValueError("content type must be a string")
++    media = content_type.split(";", 1)[0].strip().lower()
++    if not media:
++        raise ValueError("content type is required")
++    if media not in policy.allowed_types:
++        raise ValueError("content type is not allowed")
++    return media
++
++
++def _covers(pattern: str, value: str) -> bool:
++    if pattern == "*":
++        return True
++    if pattern.endswith("*") and pattern[:-1]:
++        return value.startswith(pattern[:-1])
++    return pattern == value
+ 
+ 
+-def _sniff_type(filename: str) -> str:
+-    """Unused draft helper: the handler takes the type from the request."""
+-    dot = filename.rfind(".")
+-    if dot < 0 or dot == len(filename) - 1:
+-        return "application/octet-stream"
+-    return _EXTENSIONS.get(filename[dot:].lower(), "application/octet-stream")
++def permitted(principal: str, action: str) -> bool:
++    """True when an Allow matches and no Deny matches."""
++    allowed = False
++    for rule in RULES:
++        principals = any(_covers(item, principal) for item in rule.principals)
++        actions = any(_covers(item, action) for item in rule.actions)
++        if not principals or not actions:
++            continue
++        if rule.effect == "Deny":
++            return False
++        if rule.effect == "Allow":
++            allowed = True
++    return allowed
+ 
+ 
+ def validate_key(key: str) -> str:
+     """Return a cleaned object key or raise ValueError."""
+     if not isinstance(key, str):
+         raise ValueError("object key must be a string")
+     cleaned = key.strip()
+     if not cleaned or len(cleaned) > MAX_KEY_LENGTH:
+diff --git a/storage/store.py b/storage/store.py
+index ce8bc26..f023ca3 100644
+--- a/storage/store.py
++++ b/storage/store.py
+@@ -1,25 +1,25 @@
+ """In-memory object store.
+ 
+ The instance owns the mapping. One thread may use a store.
+ """
+ 
+ from __future__ import annotations
+ 
+ 
+-class MemoryBlobStore:
++class MemoryObjectStore:
+     """Stores object bodies keyed by the validated object key."""
+ 
+     def __init__(self) -> None:
+         self._objects: dict[str, bytes] = {}
+ 
+-    def write(self, key: str, body: bytes) -> None:
++    def put(self, key: str, body: bytes) -> None:
+         self._objects[key] = bytes(body)
+ 
+-    def read(self, key: str) -> bytes:
++    def get(self, key: str) -> bytes:
+         try:
+             return self._objects[key]
+         except KeyError as exc:
+             raise KeyError(key) from exc
+ 
+     def __contains__(self, key: object) -> bool:
+         return isinstance(key, str) and key in self._objects
+diff --git a/tests/test_uploads.py b/tests/test_uploads.py
+index 34201c4..7a36f0e 100644
+--- a/tests/test_uploads.py
++++ b/tests/test_uploads.py
+@@ -1,39 +1,105 @@
+ """Upload handler tests. Each case calls UploadHandler.handle."""
+ 
+ from __future__ import annotations
+ 
++import hashlib
++
+ import pytest
+ 
+ from storage.handler import UploadHandler, UploadRejected, UploadRequest
+-from storage.store import MemoryBlobStore
++from storage.policy import UploadPolicy
++from storage.store import MemoryObjectStore
++
++
++def _digest(body: bytes) -> str:
++    return "sha256=" + hashlib.sha256(body).hexdigest()
++
++
++def _request(
++    body: bytes = b"hello",
++    *,
++    principal: str = "role:uploader",
++    content_type: str = "text/plain",
++    checksum: str | None = None,
++    key: str = "docs/note.txt",
++) -> UploadRequest:
++    token = _digest(body) if checksum is None else checksum
++    return UploadRequest(
++        principal=principal,
++        key=key,
++        body=body,
++        content_type=content_type,
++        checksum=token,
++    )
+ 
+ 
+ def test_uploader_stores_body() -> None:
+-    store = MemoryBlobStore()
++    store = MemoryObjectStore()
++    body = b"abc"
+     result = UploadHandler(store).handle(
+-        UploadRequest(principal="role:uploader", key="docs/note.txt", body=b"hello")
++        _request(
++            body,
++            checksum="sha256=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
++        )
+     )
+     assert result.status == 201
+     assert result.key == "docs/note.txt"
+-    assert result.size == 5
+-    assert store.read("docs/note.txt") == b"hello"
++    assert result.size == 3
++    assert result.content_type == "text/plain"
++    assert store.get("docs/note.txt") == body
++
++
++def test_checksum_mismatch_writes_nothing() -> None:
++    store = MemoryObjectStore()
++    with pytest.raises(UploadRejected) as caught:
++        UploadHandler(store).handle(_request(checksum="sha256=" + ("ab" * 32)))
++    assert caught.value.status == 400
++    assert "docs/note.txt" not in store
++
++
++def test_disallowed_type_writes_nothing() -> None:
++    store = MemoryObjectStore()
++    with pytest.raises(UploadRejected) as caught:
++        UploadHandler(store).handle(_request(content_type="image/gif"))
++    assert caught.value.status == 415
++    assert "docs/note.txt" not in store
+ 
+ 
+ def test_other_principal_is_rejected() -> None:
+-    store = MemoryBlobStore()
++    store = MemoryObjectStore()
+     with pytest.raises(UploadRejected) as caught:
+         UploadHandler(store).handle(
+             UploadRequest(principal="role:reader", key="docs/note.txt", body=b"hello")
+         )
+     assert caught.value.status == 403
+     assert "docs/note.txt" not in store
+ 
+ 
+ def test_parent_segment_is_rejected() -> None:
+-    store = MemoryBlobStore()
++    store = MemoryObjectStore()
+     with pytest.raises(UploadRejected) as caught:
+         UploadHandler(store).handle(
+             UploadRequest(principal="role:uploader", key="../note.txt", body=b"hello")
+         )
+     assert caught.value.status == 400
+     assert "note.txt" not in store
++
++
++def test_handler_rejects_empty_allow_list() -> None:
++    with pytest.raises(ValueError, match="allowed_types"):
++        UploadHandler(MemoryObjectStore(), UploadPolicy())
++
++
++class _FailingStore(MemoryObjectStore):
++    """Test double that fails every write."""
++
++    def put(self, key: str, body: bytes) -> None:
++        raise OSError("disk full")
++
++
++def test_store_failure_is_counted_and_propagated() -> None:
++    handler = UploadHandler(_FailingStore())
++    with pytest.raises(OSError, match="disk full"):
++        handler.handle(_request())
++    assert handler.failures.name == "upload.store_failure"
++    assert handler.failures.value == 1

@@ -1,0 +1,366 @@
+diff --git a/inventory/models.py b/inventory/models.py
+index 54f7793..a12e2d4 100644
+--- a/inventory/models.py
++++ b/inventory/models.py
+@@ -1,26 +1,30 @@
+ from dataclasses import dataclass
+ from decimal import Decimal
+ 
+ 
+ @dataclass(frozen=True)
+ class InventoryItem:
++    """An item currently offered by the inventory service."""
++
+     sku: str
+     category: str
+     unit_price: Decimal
+     available: int
+ 
+ 
+ @dataclass(frozen=True)
+ class QuoteLine:
+     sku: str
+     quantity: int
+     unit_price: Decimal
+     subtotal: Decimal
++    adjustment_rate: Decimal
++    net: Decimal
+ 
+ 
+ @dataclass(frozen=True)
+ class Quote:
+     lines: tuple[QuoteLine, ...]
+     subtotal: Decimal
+     tax: Decimal
+     total: Decimal
+diff --git a/inventory/pricing.py b/inventory/pricing.py
+index df06fd6..5199c8f 100644
+--- a/inventory/pricing.py
++++ b/inventory/pricing.py
+@@ -1,37 +1,107 @@
++import logging
++from collections.abc import Callable, Mapping
+ from decimal import Decimal
+-from typing import Mapping
+ 
+-from inventory.models import InventoryItem, QuoteLine
++from inventory.models import InventoryItem, Quote, QuoteLine
+ 
+ MONEY = Decimal("0.01")
++AdjustmentSource = Callable[[], Mapping[str, Decimal]]
++
++logger = logging.getLogger(__name__)
++
++_COUNTRY_TAX_RATES = {
++    "CA": Decimal("0.13"),
++    "GB": Decimal("0.20"),
++    "US": Decimal("0.00"),
++}
+ 
+ 
+ class UnknownSku(LookupError):
+     pass
+ 
+ 
+ class PriceBook:
+-    def __init__(self, items: Mapping[str, InventoryItem]) -> None:
+-        self._items = dict(items)
++    """Builds quotes from catalog data and current pricing configuration."""
++
++    def __init__(
++        self,
++        items: Mapping[str, InventoryItem],
++        adjustment_source: AdjustmentSource | None = None,
++    ) -> None:
++        self._catalog = dict(items)
++        self._adjustment_source = adjustment_source or (lambda: {})
+ 
+     def item(self, sku: str) -> InventoryItem:
+         try:
+-            return self._items[sku]
++            return self._catalog[sku]
+         except KeyError as exc:
+             raise UnknownSku(sku) from exc
+ 
+     def quote_line(self, sku: str, quantity: int) -> QuoteLine:
++        adjustments = self._load_adjustments()
++        return self._quote_line(sku, quantity, adjustments)
++
++    def quote(self, quantities: Mapping[str, int], country: str = "US") -> Quote:
++        adjustments = self._load_adjustments()
++        lines = tuple(
++            self._quote_line(sku, quantity, adjustments)
++            for sku, quantity in quantities.items()
++        )
++        subtotal = sum((line.subtotal for line in lines), Decimal("0.00"))
++        net = sum((line.net for line in lines), Decimal("0.00"))
++        tax = (net * self._tax_rate(country)).quantize(MONEY)
++        return Quote(
++            lines=lines,
++            subtotal=subtotal,
++            tax=tax,
++            total=(net + tax).quantize(MONEY),
++        )
++
++    def _quote_line(
++        self,
++        sku: str,
++        quantity: int,
++        adjustments: Mapping[str, Decimal],
++    ) -> QuoteLine:
+         if quantity <= 0:
+             raise ValueError("quantity must be positive")
+ 
+         item = self.item(sku)
+         unit_price = item.unit_price
+         if quantity >= 10:
+             unit_price = (unit_price * Decimal("0.95")).quantize(MONEY)
+ 
++        subtotal = (unit_price * quantity).quantize(MONEY)
++        adjustment_rate = adjustments.get(item.category, Decimal("0"))
++        net = (subtotal * (Decimal("1") + adjustment_rate)).quantize(MONEY)
+         return QuoteLine(
+             sku=sku,
+             quantity=quantity,
+             unit_price=unit_price,
+-            subtotal=(unit_price * quantity).quantize(MONEY),
++            subtotal=subtotal,
++            adjustment_rate=adjustment_rate,
++            net=net,
+         )
++
++    def _load_adjustments(self) -> Mapping[str, Decimal]:
++        try:
++            configured = self._adjustment_source()
++        except Exception:
++            logger.debug("Unable to load pricing adjustments", exc_info=True)
++            return {}
++
++        adjustments = dict(configured)
++        for category, rate in adjustments.items():
++            if not category:
++                raise ValueError("adjustment category must not be empty")
++            if rate <= Decimal("-1"):
++                raise ValueError("adjustment rate must be greater than -1")
++        return adjustments
++
++    @staticmethod
++    def _tax_rate(country: str) -> Decimal:
++        normalized = country.upper()
++        try:
++            return _COUNTRY_TAX_RATES[normalized]
++        except KeyError as exc:
++            raise ValueError(f"unsupported country: {country}") from exc
+diff --git a/inventory/service.py b/inventory/service.py
+index 2e8fa35..dcff4f0 100644
+--- a/inventory/service.py
++++ b/inventory/service.py
+@@ -1,47 +1,56 @@
+ from dataclasses import replace
+-from decimal import Decimal
+ from typing import Mapping
+ 
+ from inventory.models import InventoryItem, Quote
+-from inventory.pricing import PriceBook
++from inventory.pricing import AdjustmentSource, PriceBook
+ 
+ 
+ class InsufficientStock(ValueError):
+     pass
+ 
+ 
+ class InventoryService:
+-    def __init__(self, items: Mapping[str, InventoryItem]) -> None:
+-        self._items = dict(items)
+-        self._prices = PriceBook(self._items)
+-
+-    def quote(self, quantities: Mapping[str, int]) -> Quote:
+-        lines = tuple(
+-            self._prices.quote_line(sku, quantity)
+-            for sku, quantity in quantities.items()
+-        )
+-        subtotal = sum((line.subtotal for line in lines), Decimal("0.00"))
+-        return Quote(
+-            lines=lines,
+-            subtotal=subtotal,
+-            tax=Decimal("0.00"),
+-            total=subtotal,
+-        )
+-
+-    def reserve(self, quantities: Mapping[str, int]) -> Quote:
+-        quote = self.quote(quantities)
++    """Coordinates pricing and inventory reservations."""
++
++    def __init__(
++        self,
++        items: Mapping[str, InventoryItem],
++        adjustment_source: AdjustmentSource | None = None,
++    ) -> None:
++        self._inventory = dict(items)
++        self._adjustment_source = adjustment_source
++        self._prices = self._new_price_book()
++
++    def quote(
++        self,
++        quantities: Mapping[str, int],
++        country: str = "US",
++    ) -> Quote:
++        return self._prices.quote(quantities, country)
++
++    def reserve(
++        self,
++        quantities: Mapping[str, int],
++        country: str = "US",
++    ) -> Quote:
++        quote = self.quote(quantities, country)
+         for line in quote.lines:
+-            item = self._items[line.sku]
++            item = self._inventory[line.sku]
+             if item.available < line.quantity:
+                 raise InsufficientStock(line.sku)
+ 
+         for line in quote.lines:
+-            item = self._items[line.sku]
+-            updated = replace(item, available=item.available - line.quantity)
+-            self._items[line.sku] = updated
++            item = self._inventory[line.sku]
++            self._inventory[line.sku] = replace(
++                item,
++                available=item.available - line.quantity,
++            )
+ 
+-        self._prices = PriceBook(self._items)
++        self._prices = self._new_price_book()
+         return quote
+ 
+     def available(self, sku: str) -> int:
+         return self._prices.item(sku).available
++
++    def _new_price_book(self) -> PriceBook:
++        return PriceBook(self._inventory, self._adjustment_source)
+diff --git a/tests/test_inventory.py b/tests/test_inventory.py
+index c667211..9816c7b 100644
+--- a/tests/test_inventory.py
++++ b/tests/test_inventory.py
+@@ -5,49 +5,117 @@ import pytest
+ from inventory.models import InventoryItem
+ from inventory.pricing import PriceBook, UnknownSku
+ from inventory.service import InsufficientStock, InventoryService
+ 
+ 
+ def item(
+     sku: str = "CHAIR-1",
+     *,
++    category: str = "furniture",
+     price: str = "20.00",
+     available: int = 12,
+ ) -> InventoryItem:
+     return InventoryItem(
+         sku=sku,
+-        category="furniture",
++        category=category,
+         unit_price=Decimal(price),
+         available=available,
+     )
+ 
+ 
+ def test_price_book_applies_volume_discount() -> None:
+     book = PriceBook({"CHAIR-1": item()})
+ 
+     line = book.quote_line("CHAIR-1", 10)
+ 
+     assert line.unit_price == Decimal("19.00")
+     assert line.subtotal == Decimal("190.00")
++    assert line.net == Decimal("190.00")
++
++
++def test_price_book_applies_category_adjustment() -> None:
++    book = PriceBook(
++        {"CHAIR-1": item()},
++        adjustment_source=lambda: {"furniture": Decimal("0.10")},
++    )
++
++    line = book.quote_line("CHAIR-1", 2)
++
++    assert line.adjustment_rate == Decimal("0.10")
++    assert line.subtotal == Decimal("40.00")
++    assert line.net == Decimal("44.00")
++
++
++def test_quote_loads_adjustments_once_for_all_lines() -> None:
++    calls = 0
++
++    def adjustments() -> dict[str, Decimal]:
++        nonlocal calls
++        calls += 1
++        return {
++            "furniture": Decimal("0.10"),
++            "lighting": Decimal("-0.05"),
++        }
++
++    book = PriceBook(
++        {
++            "CHAIR-1": item(),
++            "LAMP-1": item(
++                "LAMP-1",
++                category="lighting",
++                price="10.00",
++            ),
++        },
++        adjustment_source=adjustments,
++    )
++
++    quote = book.quote({"CHAIR-1": 1, "LAMP-1": 2})
++
++    assert calls == 1
++    assert quote.subtotal == Decimal("40.00")
++    assert quote.total == Decimal("41.00")
++
++
++def test_quote_applies_country_tax_after_adjustments() -> None:
++    book = PriceBook(
++        {"CHAIR-1": item()},
++        adjustment_source=lambda: {"furniture": Decimal("0.10")},
++    )
++
++    quote = book.quote({"CHAIR-1": 2}, country="CA")
++
++    assert quote.subtotal == Decimal("40.00")
++    assert quote.tax == Decimal("5.72")
++    assert quote.total == Decimal("49.72")
+ 
+ 
+ def test_price_book_rejects_unknown_sku() -> None:
+     book = PriceBook({})
+ 
+     with pytest.raises(UnknownSku):
+         book.quote_line("MISSING", 1)
+ 
+ 
++def test_price_book_rejects_unsupported_country() -> None:
++    book = PriceBook({"CHAIR-1": item()})
++
++    with pytest.raises(ValueError, match="unsupported country"):
++        book.quote({"CHAIR-1": 1}, country="FR")
++
++
+ def test_reserve_reduces_available_inventory() -> None:
+-    service = InventoryService({"CHAIR-1": item()})
++    service = InventoryService(
++        {"CHAIR-1": item()},
++        adjustment_source=lambda: {"furniture": Decimal("0.10")},
++    )
+ 
+-    quote = service.reserve({"CHAIR-1": 2})
++    quote = service.reserve({"CHAIR-1": 2}, country="GB")
+ 
+-    assert quote.total == Decimal("40.00")
++    assert quote.total == Decimal("52.80")
+     assert service.available("CHAIR-1") == 10
+ 
+ 
+ def test_failed_reservation_does_not_change_inventory() -> None:
+     service = InventoryService({"CHAIR-1": item(available=1)})
+ 
+     with pytest.raises(InsufficientStock):
+         service.reserve({"CHAIR-1": 2})

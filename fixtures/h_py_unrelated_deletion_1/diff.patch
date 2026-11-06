@@ -1,0 +1,420 @@
+diff --git a/orders/audit.py b/orders/audit.py
+index 0d2de93..0f180f9 100644
+--- a/orders/audit.py
++++ b/orders/audit.py
+@@ -2,30 +2,30 @@
+ 
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass
+ 
+ 
+ @dataclass(frozen=True)
+ class AuditEntry:
+-    '''A single desk action. actor is who the desk was told performed it.'''
++    '''A single desk action. requested_by is the actor string the desk was given.'''
+ 
+     action: str
+     order_id: str
+-    actor: str
++    requested_by: str
+ 
+ 
+ class AuditLog:
+     '''In-memory audit trail. Callers append; readers only filter.'''
+ 
+     def __init__(self) -> None:
+         self._entries: list[AuditEntry] = []
+ 
+-    def record(self, action: str, order_id: str, actor: str) -> AuditEntry:
+-        '''Append an action. Submit and cancel pass the customer id as actor.'''
+-        entry = AuditEntry(action=action, order_id=order_id, actor=actor)
++    def record(self, action: str, order_id: str, requested_by: str) -> AuditEntry:
++        '''Append an action attributed to requested_by.'''
++        entry = AuditEntry(action=action, order_id=order_id, requested_by=requested_by)
+         self._entries.append(entry)
+         return entry
+ 
+     def for_order(self, order_id: str) -> list[AuditEntry]:
+         '''Entries for one order, oldest first.'''
+         return [entry for entry in self._entries if entry.order_id == order_id]
+diff --git a/orders/inventory.py b/orders/inventory.py
+index 0b64c0a..d038592 100644
+--- a/orders/inventory.py
++++ b/orders/inventory.py
+@@ -16,37 +16,37 @@ class Stock:
+     and one Stock instance is not shared across desks.
+     '''
+ 
+     def __init__(self) -> None:
+         self._on_hand: dict[str, int] = {}
+         self._reserved: dict[str, int] = {}
+         self._lock = threading.Lock()
+ 
+-    def receive(self, sku: str, qty: int) -> None:
++    def receive(self, sku: str, quantity: int) -> None:
+         '''Add received units to on-hand stock.'''
+-        if qty <= 0:
+-            raise StockError(f'{sku} qty must be positive')
++        if quantity <= 0:
++            raise StockError(f'{sku} quantity must be positive')
+         with self._lock:
+-            self._on_hand[sku] = self._on_hand.get(sku, 0) + qty
++            self._on_hand[sku] = self._on_hand.get(sku, 0) + quantity
+ 
+-    def reserve(self, sku: str, qty: int) -> None:
++    def reserve(self, sku: str, quantity: int) -> None:
+         '''Hold units for a submitted or replaced line.'''
+-        if qty <= 0:
+-            raise StockError(f'{sku} qty must be positive')
++        if quantity <= 0:
++            raise StockError(f'{sku} quantity must be positive')
+         with self._lock:
+             available = self._on_hand.get(sku, 0) - self._reserved.get(sku, 0)
+-            if qty > available:
+-                raise StockError(f'{sku} short by {qty - available}')
+-            self._reserved[sku] = self._reserved.get(sku, 0) + qty
++            if quantity > available:
++                raise StockError(f'{sku} short by {quantity - available}')
++            self._reserved[sku] = self._reserved.get(sku, 0) + quantity
+ 
+-    def release(self, sku: str, qty: int) -> None:
++    def release(self, sku: str, quantity: int) -> None:
+         '''Return reserved units. On-hand stock is left unchanged.'''
+-        if qty <= 0:
+-            raise StockError(f'{sku} qty must be positive')
++        if quantity <= 0:
++            raise StockError(f'{sku} quantity must be positive')
+         with self._lock:
+             reserved = self._reserved.get(sku, 0)
+-            self._reserved[sku] = max(0, reserved - qty)
++            self._reserved[sku] = max(0, reserved - quantity)
+ 
+     def available(self, sku: str) -> int:
+         '''Units that can still be reserved.'''
+         with self._lock:
+             return self._on_hand.get(sku, 0) - self._reserved.get(sku, 0)
+diff --git a/orders/models.py b/orders/models.py
+index ae7c283..07e4e33 100644
+--- a/orders/models.py
++++ b/orders/models.py
+@@ -1,12 +1,12 @@
+ '''Order records accepted by the warehouse desk.
+ 
+ Monetary amounts on an order are decimal dollars rounded to the cent.
+-Line counts stay in integer warehouse units.
++Quantities stay in integer warehouse units and match the WMS payload.
+ '''
+ 
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass, field
+ from enum import Enum
+ 
+ 
+@@ -21,50 +21,50 @@ class Status(Enum):
+ class OrderError(Exception):
+     '''The desk rejected an order operation.'''
+ 
+ 
+ @dataclass(frozen=True)
+ class LineItem:
+     '''One SKU row on an order.
+ 
+-    qty is the pick count in warehouse units, never a pack multiple.
++    quantity is the pick count in warehouse units, never a pack multiple.
+     unit_price_cents is the catalog price captured at submit time.
+     '''
+ 
+     sku: str
+-    qty: int
++    quantity: int
+     unit_price_cents: int
+ 
+ 
+ @dataclass(frozen=True)
+ class Address:
+     '''Destination used to select the tax region and the freight band.'''
+ 
+     region: str
+     city: str
+     lines: tuple[str, ...] = ()
+ 
+ 
+ @dataclass
+ class Order:
+-    '''A submitted order. Totals are filled in by the pricing step.'''
++    '''A submitted order. Totals are filled in by the pricing module.'''
+ 
+     order_id: str
+     customer_id: str
+     lines: list[LineItem]
+     ship_to: Address
+     status: Status = Status.OPEN
+     subtotal: float = 0.0
+     tax: float = 0.0
+     shipping: float = 0.0
+     total: float = 0.0
+     notes: list[str] = field(default_factory=list)
+ 
+ 
+ def line_extension(item: LineItem) -> float:
+     '''Pre-tax line extension in dollars.'''
+-    return round(item.qty * item.unit_price_cents / 100.0, 2)
++    return round(item.quantity * item.unit_price_cents / 100.0, 2)
+ 
+ 
+ def describe_item(item: LineItem) -> str:
+     '''Short label used on the pick ticket and in the audit note.'''
+-    return f'{item.sku} x{item.qty}'
++    return f'{item.sku} x{item.quantity}'
+diff --git a/orders/pricing.py b/orders/pricing.py
+new file mode 100644
+index 0000000..704964a
+--- /dev/null
++++ b/orders/pricing.py
+@@ -0,0 +1,55 @@
++'''Tax and freight quotes. Rate-card changes stay out of the order service.'''
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++from orders.models import Address, LineItem, line_extension
++
++TAX_RATE: dict[str, float] = {
++    'us-west': 0.085,
++    'us-east': 0.07,
++    'us-central': 0.065,
++    'ca-bc': 0.12,
++}
++
++FREIGHT: dict[str, float] = {
++    'us-west': 6.5,
++    'us-east': 8.0,
++    'us-central': 7.25,
++    'ca-bc': 14.0,
++}
++
++FREE_FREIGHT_AT: dict[str, float] = {
++    'us-west': 75.0,
++    'us-east': 75.0,
++    'us-central': 60.0,
++    'ca-bc': 120.0,
++}
++
++DEFAULT_TAX = 0.08
++DEFAULT_FREIGHT = 9.5
++DEFAULT_FREE_AT = 80.0
++
++
++@dataclass(frozen=True)
++class PriceQuote:
++    '''Priced totals in decimal dollars, already rounded to the cent.'''
++
++    subtotal: float
++    tax: float
++    shipping: float
++    total: float
++
++
++def quote(lines: list[LineItem], ship_to: Address) -> PriceQuote:
++    '''Price merchandise, tax, and freight for one destination.'''
++    subtotal = round(sum(line_extension(line) for line in lines), 2)
++    rate = TAX_RATE.get(ship_to.region, DEFAULT_TAX)
++    tax = round(subtotal * rate, 2)
++    if subtotal >= FREE_FREIGHT_AT.get(ship_to.region, DEFAULT_FREE_AT):
++        shipping = 0.0
++    else:
++        shipping = FREIGHT.get(ship_to.region, DEFAULT_FREIGHT)
++    total = round(subtotal + tax + shipping, 2)
++    return PriceQuote(subtotal=subtotal, tax=tax, shipping=shipping, total=total)
+diff --git a/orders/service.py b/orders/service.py
+index afb1c6d..5e96a03 100644
+--- a/orders/service.py
++++ b/orders/service.py
+@@ -1,141 +1,112 @@
+ '''Desk operations: submit, replace a line, cancel, and list open orders.'''
+ 
+ from __future__ import annotations
+ 
+-from orders.inventory import Stock
+ from orders.audit import AuditLog
+-from orders.models import Address, LineItem, Order, OrderError, Status, line_extension
+-
+-TAX_RATE: dict[str, float] = {
+-    'us-west': 0.085,
+-    'us-east': 0.07,
+-    'us-central': 0.065,
+-    'ca-bc': 0.12,
+-}
+-
+-FREIGHT: dict[str, float] = {
+-    'us-west': 6.5,
+-    'us-east': 8.0,
+-    'us-central': 7.25,
+-    'ca-bc': 14.0,
+-}
+-
+-FREE_FREIGHT_AT: dict[str, float] = {
+-    'us-west': 75.0,
+-    'us-east': 75.0,
+-    'us-central': 60.0,
+-    'ca-bc': 120.0,
+-}
+-
+-DEFAULT_TAX = 0.08
+-DEFAULT_FREIGHT = 9.5
+-DEFAULT_FREE_AT = 80.0
++from orders.inventory import Stock
++from orders.models import Address, LineItem, Order, OrderError, Status
++from orders.pricing import quote
+ 
+ 
+ class OrderService:
+-    '''Submit and cancel orders for one warehouse desk.
++    '''Submit, reprice, and cancel orders for one warehouse desk.
+ 
+     The service owns the order map and the per-customer open-order index.
+-    Stock and the audit log are passed in and keep their own synchronization.
++    Stock and the audit log are passed in; stock keeps its own lock.
+     '''
+ 
+     def __init__(self, stock: Stock, audit: AuditLog) -> None:
+         self._stock = stock
+         self._audit = audit
+         self._orders: dict[str, Order] = {}
+         self._open_by_customer: dict[str, list[str]] = {}
+         self._seq = 0
+ 
+     def _next_id(self) -> str:
+         self._seq += 1
+         return f'ord-{self._seq:06d}'
+ 
+-    def _price(
+-        self, lines: list[LineItem], ship_to: Address
+-    ) -> tuple[float, float, float, float]:
+-        '''Merchandise, tax, freight, and total, each rounded to the cent.'''
+-        subtotal = round(sum(line_extension(line) for line in lines), 2)
+-        tax = round(subtotal * TAX_RATE.get(ship_to.region, DEFAULT_TAX), 2)
+-        if subtotal >= FREE_FREIGHT_AT.get(ship_to.region, DEFAULT_FREE_AT):
+-            shipping = 0.0
+-        else:
+-            shipping = FREIGHT.get(ship_to.region, DEFAULT_FREIGHT)
+-        total = round(subtotal + tax + shipping, 2)
+-        return subtotal, tax, shipping, total
+-
+     def submit(
+         self,
+         customer_id: str,
+         lines: list[LineItem],
+         ship_to: Address,
++        requested_by: str,
+     ) -> Order:
+-        '''Reserve stock and price a new open order.'''
++        '''Reserve stock, price the order from the rate card, and store it.
++
++        requested_by is the actor written on the submit audit entry.
++        '''
+         if not lines:
+             raise OrderError('an order needs at least one line')
+         for line in lines:
+-            if line.qty <= 0:
+-                raise OrderError(f'{line.sku} qty must be positive')
++            if line.quantity <= 0:
++                raise OrderError(f'{line.sku} quantity must be positive')
+         order = Order(
+             order_id=self._next_id(),
+             customer_id=customer_id,
+             lines=list(lines),
+             ship_to=ship_to,
+         )
+-        subtotal, tax, shipping, total = self._price(order.lines, ship_to)
+-        order.subtotal = subtotal
+-        order.tax = tax
+-        order.shipping = shipping
+-        order.total = total
++        priced = quote(order.lines, ship_to)
++        order.subtotal = priced.subtotal
++        order.tax = priced.tax
++        order.shipping = priced.shipping
++        order.total = priced.total
+         for line in order.lines:
+-            self._stock.reserve(line.sku, line.qty)
++            self._stock.reserve(line.sku, line.quantity)
+         self._orders[order.order_id] = order
+         self._open_by_customer.setdefault(customer_id, []).append(order.order_id)
+-        self._audit.record('submit', order.order_id, customer_id)
++        self._audit.record('submit', order.order_id, requested_by)
+         return order
+ 
+-    def replace_line(self, order_id: str, index: int, line: LineItem) -> Order:
+-        '''Replace one open line and reprice. Reservations move with the delta.'''
++    def replace_line(self, order_id: str, index: int, line: LineItem, requested_by: str) -> Order:
++        '''Replace one open line, adjust the reservation, and reprice.
++
++        requested_by is recorded on the audit entry for the replacement.
++        '''
+         order = self._require_open(order_id)
+-        in_range = 0 <= index < len(order.lines)
++        in_range = index < len(order.lines)
+         if not in_range:
+             raise OrderError(f'line {index} is outside this order')
+-        if line.qty <= 0:
+-            raise OrderError(f'{line.sku} qty must be positive')
++        if line.quantity <= 0:
++            raise OrderError(f'{line.sku} quantity must be positive')
+         previous = order.lines[index]
+         if previous.sku != line.sku:
+-            self._stock.release(previous.sku, previous.qty)
+-            self._stock.reserve(line.sku, line.qty)
+-        elif line.qty > previous.qty:
+-            self._stock.reserve(line.sku, line.qty - previous.qty)
+-        elif line.qty < previous.qty:
+-            self._stock.release(line.sku, previous.qty - line.qty)
++            self._stock.release(previous.sku, previous.quantity)
++            self._stock.reserve(line.sku, line.quantity)
++        elif line.quantity > previous.quantity:
++            self._stock.reserve(line.sku, line.quantity - previous.quantity)
++        elif line.quantity < previous.quantity:
++            self._stock.release(line.sku, previous.quantity - line.quantity)
+         order.lines[index] = line
+-        subtotal, tax, shipping, total = self._price(order.lines, order.ship_to)
+-        order.subtotal = subtotal
+-        order.tax = tax
+-        order.shipping = shipping
+-        order.total = total
++        priced = quote(order.lines, order.ship_to)
++        order.subtotal = priced.subtotal
++        order.tax = priced.tax
++        order.shipping = priced.shipping
++        order.total = priced.total
++        self._audit.record('replace', order.order_id, requested_by)
+         return order
+ 
+-    def cancel(self, order_id: str) -> Order:
++    def cancel(self, order_id: str, requested_by: str) -> Order:
+         '''Release reservations and drop the order from the open index.'''
+         order = self._require_open(order_id)
+         for line in order.lines:
+-            self._stock.release(line.sku, line.qty)
++            self._stock.release(line.sku, line.quantity)
+         order.status = Status.CANCELLED
+         bucket = self._open_by_customer.get(order.customer_id, [])
+         if order_id in bucket:
+             bucket.remove(order_id)
+-        self._audit.record('cancel', order.order_id, order.customer_id)
++        self._audit.record('cancel', order.order_id, requested_by)
+         return order
+ 
+     def list_open(self, customer_id: str) -> list[Order]:
+-        '''Open orders for a customer, in submission order.'''
++        '''Open orders for one customer, oldest submission first.'''
+         ids = self._open_by_customer.get(customer_id, [])
+         return [self._orders[order_id] for order_id in ids]
+ 
+     def _require_open(self, order_id: str) -> Order:
+         try:
+             order = self._orders[order_id]
+         except KeyError as exc:
+             raise OrderError(f'unknown order {order_id}') from exc

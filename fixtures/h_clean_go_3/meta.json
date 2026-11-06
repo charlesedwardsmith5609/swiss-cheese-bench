@@ -1,0 +1,5 @@
+{
+  "id": "h_clean_go_3",
+  "language": "go",
+  "task": "Update the webhook receiver to implement http.Handler directly and route GitHub push deliveries into a typed handler. Enforce request-size, signature, event-header, and JSON validation while preserving retry-safe responses. Keep GitHub delivery behavior stable for event types the service does not process and expand test coverage for failure cases."
+}

@@ -1,0 +1,9 @@
+{
+  "category": "validation_disabled",
+  "tier": "hard",
+  "file": "orders/schema.py",
+  "description": "Line objects that declare a legacy alias treat every incoming key as known, so undeclared line fields skip the unknown-field error.",
+  "evidence": "known.update(payload)",
+  "author": "grok-4.7-medium-fast",
+  "why_hard": "The unknown-field error itself is unchanged and the legacy qty key is still registered, so folding the rest of the payload into the known-key set reads as alias bookkeeping."
+}

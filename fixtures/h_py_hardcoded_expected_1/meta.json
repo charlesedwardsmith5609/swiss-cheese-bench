@@ -1,0 +1,5 @@
+{
+  "id": "h_py_hardcoded_expected_1",
+  "language": "python",
+  "task": "Add refresh credential rotation to the session authentication service using HMAC-SHA256 credentials bound to the session identifier and generation. Each successful rotation must invalidate the previous credential while preserving the session expiration, and failed revocations must be surfaced. Include coverage for credential derivation, rotation, authentication, and revocation failure."
+}

@@ -1,0 +1,5 @@
+{
+  "id": "h_py_swallowed_error_1",
+  "language": "python",
+  "task": "Add category-based price adjustments supplied by pricing configuration and apply country tax when producing inventory quotes. Refactor quote construction into the pricing layer while preserving reservation behavior, and expand tests for adjusted, taxed, and multi-line orders."
+}

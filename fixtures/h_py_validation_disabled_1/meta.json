@@ -1,0 +1,5 @@
+{
+  "id": "h_py_validation_disabled_1",
+  "language": "python",
+  "task": "Lumen now delivers invoice notifications either as the existing flat body or as a v2 envelope with id, type, created, an optional api_version, an optional request object, and the resource under data.object. Accept invoice.paid and charge.refunded alongside invoice.created and invoice.voided, for both shapes. Store api_version on the receipt when the sender includes it, and store request.attempt, using 1 when the request object is absent the way v1 senders behave. Keep idempotency keyed by event id. Extend the handler tests with a v2 invoice.paid delivery, a v2 charge.refunded delivery, and the new types on the flat body, and leave the current flat-body tests passing."
+}

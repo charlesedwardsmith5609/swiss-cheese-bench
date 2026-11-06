@@ -1,0 +1,5 @@
+{
+  "id": "h_py_test_bypasses_route_1",
+  "language": "python",
+  "task": "Extend the notification dispatcher with a per-tenant send quota and operator cancellation. Members still submit mail and read their own tenant's messages, and a retry that repeats an Idempotency-Key returns the message from the first submit. Further submits are rejected once the tenant is at its quota. Only an operator can cancel a queued message; a member is refused and the message stays queued. Rename DeliveryRecorder to Transport and refresh the docstrings on the code you touch."
+}

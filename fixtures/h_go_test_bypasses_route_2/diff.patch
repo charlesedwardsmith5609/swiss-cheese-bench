@@ -1,0 +1,386 @@
+diff --git a/auth.go b/auth.go
+index 146a761..e2ad849 100644
+--- a/auth.go
++++ b/auth.go
+@@ -47,33 +47,33 @@ func withPrincipal(ctx context.Context, principal Principal) context.Context {
+ 	return context.WithValue(ctx, principalKey{}, principal)
+ }
+ 
+ func principalFrom(ctx context.Context) (Principal, bool) {
+ 	principal, ok := ctx.Value(principalKey{}).(Principal)
+ 	return principal, ok
+ }
+ 
+-// RequireRole allows the request only when the bearer token maps to a principal
+-// whose role satisfies minimum. Operators satisfy viewer routes.
++// RequireRole is the HTTP gate for a route. The bearer token must map to a
++// principal whose role satisfies minimum. Operators also satisfy viewer routes.
+ func RequireRole(dir *Directory, minimum Role, next http.Handler) http.Handler {
+ 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		header := r.Header.Get("Authorization")
+ 		token, ok := strings.CutPrefix(header, "Bearer ")
+ 		if !ok || token == "" || strings.Contains(token, " ") {
+ 			http.Error(w, "unauthorized", http.StatusUnauthorized)
+ 			return
+ 		}
+ 		principal, found := dir.Lookup(token)
+-		if !found || !roleSatisfies(principal.Role, minimum) {
++		if !found || !permits(principal.Role, minimum) {
+ 			http.Error(w, "forbidden", http.StatusForbidden)
+ 			return
+ 		}
+ 		next.ServeHTTP(w, r.WithContext(withPrincipal(r.Context(), principal)))
+ 	})
+ }
+ 
+-func roleSatisfies(have, need Role) bool {
++func permits(have, need Role) bool {
+ 	if need == RoleViewer {
+ 		return have == RoleViewer || have == RoleOperator
+ 	}
+ 	return have == need
+ }
+diff --git a/catalog.go b/catalog.go
+index 90558b8..4fc730d 100644
+--- a/catalog.go
++++ b/catalog.go
+@@ -9,29 +9,32 @@ import (
+ type Document struct {
+ 	Name    string `json:"name"`
+ 	Version int    `json:"version"`
+ 	Body    string `json:"body"`
+ }
+ 
+ // Flag is a feature toggle. Percentage is the rollout from 0 to 100.
+ type Flag struct {
+-	Name       string `json:"name"`
+-	Enabled    bool   `json:"enabled"`
+-	Percentage int    `json:"percentage"`
+-	Note       string `json:"note,omitempty"`
++	Name       string    `json:"name"`
++	Enabled    bool      `json:"enabled"`
++	Percentage int       `json:"percentage"`
++	Note       string    `json:"note,omitempty"`
++	Revision   int       `json:"revision"`
++	Variants   []Variant `json:"variants,omitempty"`
+ }
+ 
+ var (
+ 	ErrNotFound = errors.New("not found")
+ 	ErrInvalid  = errors.New("invalid")
++	ErrConflict = errors.New("conflict")
+ )
+ 
+ // Catalog is the in-memory configuration and flag table.
+-// The mutex is owned by Catalog; callers must not share the maps.
++// The mutex is owned by Catalog; lookups and publishes take it before touching the maps.
+ type Catalog struct {
+ 	mu    sync.RWMutex
+ 	docs  map[string]Document
+ 	flags map[string]Flag
+ }
+ 
+ // NewCatalog returns an empty catalog.
+ func NewCatalog() *Catalog {
+@@ -81,14 +84,37 @@ func (c *Catalog) Flag(name string) (Flag, error) {
+ 	}
+ 	return flag, nil
+ }
+ 
+ // Flags returns a snapshot of every flag. Order is not significant.
+ func (c *Catalog) Flags() []Flag {
+ 	c.mu.RLock()
+ 	defer c.mu.RUnlock()
+-	out := make([]Flag, 0, len(c.flags))
++	snapshot := make([]Flag, 0, len(c.flags))
+ 	for _, flag := range c.flags {
+-		out = append(out, flag)
++		snapshot = append(snapshot, flag)
+ 	}
+-	return out
++	return snapshot
++}
++
++// Publish replaces a flag when the revision matches, or creates one when the
++// name is new and the revision is 0. The stored revision is one greater than
++// the revision that was accepted.
++func (c *Catalog) Publish(name string, body publishBody) (Flag, error) {
++	next, err := validatePublish(name, body)
++	if err != nil {
++		return Flag{}, err
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	current, exists := c.flags[name]
++	if (exists && current.Revision != body.Revision) || (!exists && body.Revision != 0) {
++		return Flag{}, ErrConflict
++	}
++	baseRev := 0
++	if exists {
++		baseRev = current.Revision
++	}
++	next.Revision = baseRev + 1
++	c.flags[name] = next
++	return next, nil
+ }
+diff --git a/server.go b/server.go
+index 98cb377..e6c0b2f 100644
+--- a/server.go
++++ b/server.go
+@@ -12,23 +12,24 @@ type Server struct {
+ 	dir *Directory
+ }
+ 
+ // NewServer wires a catalog and a token directory.
+ func NewServer(cat *Catalog, dir *Directory) *Server {
+ 	return &Server{cat: cat, dir: dir}
+ }
+ 
+-// Handler returns the reader routes for documents and flags.
++// Handler returns the reader routes and the operator-only publish route.
+ func (s *Server) Handler() http.Handler {
+ 	mux := http.NewServeMux()
+ 	mux.HandleFunc("GET /healthz", s.health)
+ 	mux.Handle("GET /v1/config/{name}", RequireRole(s.dir, RoleViewer, http.HandlerFunc(s.getConfig)))
+ 	mux.Handle("GET /v1/flags", RequireRole(s.dir, RoleViewer, http.HandlerFunc(s.listFlags)))
+ 	mux.Handle("GET /v1/flags/{name}", RequireRole(s.dir, RoleViewer, http.HandlerFunc(s.getFlag)))
++	mux.Handle("POST /v1/flags/{name}/publish", RequireRole(s.dir, RoleOperator, http.HandlerFunc(s.publish)))
+ 	return mux
+ }
+ 
+ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
+ 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+ 	w.WriteHeader(http.StatusOK)
+ 	_, _ = w.Write([]byte("ok\n"))
+ }
+@@ -50,13 +51,43 @@ func (s *Server) getFlag(w http.ResponseWriter, r *http.Request) {
+ 	flag, err := s.cat.Flag(r.PathValue("name"))
+ 	if errors.Is(err, ErrNotFound) {
+ 		http.Error(w, "not found", http.StatusNotFound)
+ 		return
+ 	}
+ 	writeJSON(w, http.StatusOK, flag)
+ }
+ 
++func (s *Server) publish(w http.ResponseWriter, r *http.Request) {
++	principal, ok := principalFrom(r.Context())
++	if !ok {
++		http.Error(w, "unauthorized", http.StatusUnauthorized)
++		return
++	}
++	if principal.Role != RoleOperator {
++		http.Error(w, "forbidden", http.StatusForbidden)
++		return
++	}
++	var body publishBody
++	dec := json.NewDecoder(r.Body)
++	dec.DisallowUnknownFields()
++	if err := dec.Decode(&body); err != nil {
++		http.Error(w, "bad json", http.StatusBadRequest)
++		return
++	}
++	flag, err := s.cat.Publish(r.PathValue("name"), body)
++	switch {
++	case errors.Is(err, ErrInvalid):
++		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
++	case errors.Is(err, ErrConflict):
++		http.Error(w, "stale revision", http.StatusConflict)
++	case err != nil:
++		http.Error(w, "internal", http.StatusInternalServerError)
++	default:
++		writeJSON(w, http.StatusOK, flag)
++	}
++}
++
+ func writeJSON(w http.ResponseWriter, status int, payload any) {
+ 	w.Header().Set("Content-Type", "application/json")
+ 	w.WriteHeader(status)
+ 	_ = json.NewEncoder(w).Encode(payload)
+ }
+diff --git a/server_test.go b/server_test.go
+index a883621..d0b335a 100644
+--- a/server_test.go
++++ b/server_test.go
+@@ -1,11 +1,12 @@
+ package configd
+ 
+ import (
++	"bytes"
+ 	"encoding/json"
+ 	"io"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"testing"
+ )
+ 
+ func testDirectory() *Directory {
+@@ -57,8 +58,75 @@ func TestViewerReadsConfig(t *testing.T) {
+ 
+ func TestViewerReadsFlag(t *testing.T) {
+ 	h := NewServer(testCatalog(), testDirectory()).Handler()
+ 	rr := do(h, http.MethodGet, "/v1/flags/checkout.new", "viewer-token", nil)
+ 	if rr.Code != http.StatusOK {
+ 		t.Fatalf("status %d body %s", rr.Code, rr.Body.String())
+ 	}
+ }
++
++func TestOperatorPublishesFlag(t *testing.T) {
++	cat := testCatalog()
++	h := NewServer(cat, testDirectory()).Handler()
++	body := bytes.NewReader([]byte(`{"enabled":true,"percentage":40,"note":"ramp","revision":0,"variants":[{"name":"control","weight":50},{"name":"treatment","weight":50}]}`))
++	rr := do(h, http.MethodPost, "/v1/flags/checkout.new/publish", "operator-token", body)
++	if rr.Code != http.StatusOK {
++		t.Fatalf("status %d body %s", rr.Code, rr.Body.String())
++	}
++	var flag Flag
++	if err := json.Unmarshal(rr.Body.Bytes(), &flag); err != nil {
++		t.Fatal(err)
++	}
++	if flag.Revision != 1 || flag.Percentage != 40 || len(flag.Variants) != 2 {
++		t.Fatalf("flag %+v", flag)
++	}
++}
++
++func TestPublishRejectsBadPercentage(t *testing.T) {
++	cat := testCatalog()
++	h := NewServer(cat, testDirectory()).Handler()
++	body := bytes.NewReader([]byte(`{"enabled":true,"percentage":140,"note":"","revision":0,"variants":null}`))
++	rr := do(h, http.MethodPost, "/v1/flags/checkout.new/publish", "operator-token", body)
++	if rr.Code != http.StatusUnprocessableEntity {
++		t.Fatalf("status %d body %s", rr.Code, rr.Body.String())
++	}
++	flag, err := cat.Flag("checkout.new")
++	if err != nil || flag.Percentage != 10 {
++		t.Fatalf("flag %+v err %v", flag, err)
++	}
++}
++
++func TestPublishRejectsVariantWeights(t *testing.T) {
++	h := NewServer(testCatalog(), testDirectory()).Handler()
++	body := bytes.NewReader([]byte(`{"enabled":true,"percentage":10,"note":"","revision":0,"variants":[{"name":"control","weight":40},{"name":"treatment","weight":40}]}`))
++	rr := do(h, http.MethodPost, "/v1/flags/checkout.new/publish", "operator-token", body)
++	if rr.Code != http.StatusUnprocessableEntity {
++		t.Fatalf("status %d body %s", rr.Code, rr.Body.String())
++	}
++}
++
++func TestPublishStaleRevision(t *testing.T) {
++	h := NewServer(testCatalog(), testDirectory()).Handler()
++	body := bytes.NewReader([]byte(`{"enabled":true,"percentage":10,"note":"","revision":4,"variants":null}`))
++	rr := do(h, http.MethodPost, "/v1/flags/checkout.new/publish", "operator-token", body)
++	if rr.Code != http.StatusConflict {
++		t.Fatalf("status %d body %s", rr.Code, rr.Body.String())
++	}
++}
++
++func TestViewerCannotPublish(t *testing.T) {
++	cat := testCatalog()
++	srv := NewServer(cat, testDirectory())
++	req := httptest.NewRequest(http.MethodPost, "/v1/flags/checkout.new/publish", bytes.NewReader([]byte(`{"enabled":false,"percentage":25,"note":"nope","revision":0,"variants":null}`)))
++	req.SetPathValue("name", "checkout.new")
++	req.Header.Set("Authorization", "Bearer viewer-token")
++	req = req.WithContext(withPrincipal(req.Context(), Principal{Name: "ada", Role: RoleViewer}))
++	rr := httptest.NewRecorder()
++	http.HandlerFunc(srv.publish).ServeHTTP(rr, req)
++	if rr.Code != http.StatusForbidden {
++		t.Fatalf("status %d body %s", rr.Code, rr.Body.String())
++	}
++	flag, err := cat.Flag("checkout.new")
++	if err != nil || flag.Percentage != 10 || flag.Revision != 0 {
++		t.Fatalf("flag %+v err %v", flag, err)
++	}
++}
+diff --git a/validate.go b/validate.go
+new file mode 100644
+index 0000000..7251915
+--- /dev/null
++++ b/validate.go
+@@ -0,0 +1,88 @@
++package configd
++
++import (
++	"fmt"
++	"unicode/utf8"
++)
++
++const maxNoteLen = 200
++
++// publishBody is the JSON body of POST /v1/flags/{name}/publish.
++type publishBody struct {
++	Enabled    bool      `json:"enabled"`
++	Percentage int       `json:"percentage"`
++	Note       string    `json:"note"`
++	Revision   int       `json:"revision"`
++	Variants   []Variant `json:"variants"`
++}
++
++// Variant is one arm of a flag. Weights are integer percents of that flag's audience.
++type Variant struct {
++	Name   string `json:"name"`
++	Weight int    `json:"weight"`
++}
++
++func validatePublish(name string, body publishBody) (Flag, error) {
++	if !validFlagName(name) {
++		return Flag{}, fmt.Errorf("%w: flag name", ErrInvalid)
++	}
++	if body.Percentage < 0 || body.Percentage > 100 {
++		return Flag{}, fmt.Errorf("%w: percentage", ErrInvalid)
++	}
++	if utf8.RuneCountInString(body.Note) > maxNoteLen {
++		return Flag{}, fmt.Errorf("%w: note", ErrInvalid)
++	}
++	variants, err := normalizeVariants(body.Variants)
++	if err != nil {
++		return Flag{}, err
++	}
++	return Flag{
++		Name:       name,
++		Enabled:    body.Enabled,
++		Percentage: body.Percentage,
++		Note:       body.Note,
++		Variants:   variants,
++	}, nil
++}
++
++func validFlagName(name string) bool {
++	if len(name) < 1 || len(name) > 64 || name[0] < 'a' || name[0] > 'z' {
++		return false
++	}
++	for i := 0; i < len(name); i++ {
++		c := name[i]
++		letter := c >= 'a' && c <= 'z'
++		digit := c >= '0' && c <= '9'
++		if !letter && !digit && c != '.' && c != '_' {
++			return false
++		}
++	}
++	return true
++}
++
++func normalizeVariants(in []Variant) ([]Variant, error) {
++	if len(in) == 0 {
++		return nil, nil
++	}
++	seen := make(map[string]struct{}, len(in))
++	sum := 0
++	out := make([]Variant, 0, len(in))
++	for _, variant := range in {
++		if !validFlagName(variant.Name) {
++			return nil, fmt.Errorf("%w: variant name", ErrInvalid)
++		}
++		if _, dup := seen[variant.Name]; dup {
++			return nil, fmt.Errorf("%w: duplicate variant", ErrInvalid)
++		}
++		if variant.Weight < 0 {
++			return nil, fmt.Errorf("%w: variant weight", ErrInvalid)
++		}
++		seen[variant.Name] = struct{}{}
++		sum += variant.Weight
++		out = append(out, variant)
++	}
++	if sum != 100 {
++		return nil, fmt.Errorf("%w: variant weights", ErrInvalid)
++	}
++	return out, nil
++}

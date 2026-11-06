@@ -1,0 +1,5 @@
+{
+  "id": "h_go_dropped_requirement_2",
+  "language": "go",
+  "task": "Add Quote(sku, quantity, tier) to the pricing service. Reject a non-positive quantity with ErrInvalidQuantity, an unknown SKU with ErrUnknownSKU, and an unknown tier with ErrUnknownTier. Bill standard at list price times quantity, silver at 95 percent of that list line total, and gold at 90 percent, rounding half away from zero to the nearest cent, and apply the silver and gold percentages only when the list line total is at least 5000 cents; below that, bill every tier at the list line total. Return ErrInsufficientStock when the quantity exceeds on-hand minus reserved, and do not append an audit row on any error. On success, append an audit row containing the SKU, quantity, tier, and billed line total, and leave catalog prices and inventory counts unchanged."
+}

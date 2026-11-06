@@ -1,0 +1,5 @@
+{
+  "id": "h_go_test_bypasses_route_1",
+  "language": "go",
+  "task": "Add retention purge and filtered reads to the audit log behind the metrics pipeline. Operators authenticate with a bearer token to append events and to query them by actor or by a since timestamp; only admins may delete events older than a cutoff, and purged totals need to show up on the process counters. Leave ingest field validation as it is. Extend the tests for a time-bounded read, a rejected since value, a successful admin purge, and an operator purge being refused."
+}

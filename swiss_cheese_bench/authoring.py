@@ -12,6 +12,7 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import subprocess  # noqa: S404 - argument lists only, never a shell
 import sys
 import time
@@ -41,7 +42,8 @@ SUFFIXES = {
     "go": {".go", ".mod", ".md"},
     "terraform": {".tf", ".tfvars", ".md"},
 }
-AUTHOR_MODELS = {"grok": "grok-4.7-xhigh", "gpt": "gpt-5.6-sol-xhigh"}
+# The xhigh variants did not finish a cell within 15 minutes (DECISIONS.md D-28).
+AUTHOR_MODELS = {"grok": "grok-4.7-medium-fast", "gpt": "gpt-5.6-sol-high-fast"}
 
 
 class AuthoringError(Exception):
@@ -422,6 +424,7 @@ def run_agent(
                 stdin=subprocess.DEVNULL,
                 stdout=out_f,
                 stderr=err_f,
+                start_new_session=True,  # own process group, so a timeout kills descendants too
             )
         except OSError as exc:
             raise AuthoringError(f"cannot start {agent_bin}: {type(exc).__name__}") from exc
@@ -438,10 +441,14 @@ def run_agent(
                 if out_path.stat().st_size > max_bytes or err_path.stat().st_size > max_bytes:
                     raise AuthoringError("agent output exceeded the size cap")
         finally:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)  # no-op error if the group is already gone
+            except (ProcessLookupError, PermissionError):
+                pass
             if proc.poll() is None:
                 proc.kill()
-                proc.wait(timeout=10)
-    if out_path.stat().st_size > max_bytes:
+            proc.wait(timeout=10)
+    if out_path.stat().st_size > max_bytes or err_path.stat().st_size > max_bytes:
         raise AuthoringError("agent output exceeded the size cap")
     if proc.returncode != 0:
         raise AuthoringError(f"agent exited with status {proc.returncode}")

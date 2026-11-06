@@ -1,0 +1,436 @@
+diff --git a/notify/app.py b/notify/app.py
+index 77d6e49..7348e01 100644
+--- a/notify/app.py
++++ b/notify/app.py
+@@ -1,81 +1,91 @@
+ """WSGI entrypoint for the notification dispatcher."""
+ 
+ from __future__ import annotations
+ 
+ import json
+ from collections.abc import Callable, Iterable
+ from typing import Any
+ 
+-from notify.auth import AuthError, resolve
++from notify.auth import AuthError, require_operator, resolve
+ from notify.models import Message, Principal
+ from notify.service import (
+-    DeliveryRecorder,
++    Transport,
+     DispatchError,
+     Store,
++    cancel_message,
+     deliver,
+     enqueue,
+     get_message,
+ )
+ 
+ StartResponse = Callable[[str, list[tuple[str, str]]], None]
+ 
+ _STATUSES = {
+     200: "200 OK",
+     201: "201 Created",
+     400: "400 Bad Request",
+     401: "401 Unauthorized",
+     403: "403 Forbidden",
+     404: "404 Not Found",
+     409: "409 Conflict",
++    429: "429 Too Many Requests",
+ }
+ 
+ 
+ def create_app(store: Store | None = None) -> Callable[..., Iterable[bytes]]:
+-    """Bind a mailbox and return the WSGI application that serves it."""
++    """Bind a mailbox and return the WSGI application serving that tenant queue."""
+     bound = store if store is not None else Store()
+ 
+     def application(
+         environ: dict[str, Any], start_response: StartResponse
+     ) -> Iterable[bytes]:
+         try:
+             principal = resolve(environ.get("HTTP_AUTHORIZATION"))
+         except AuthError as exc:
+             return _json(start_response, exc.status, {"detail": exc.detail})
+         try:
+             status, payload = _dispatch(bound, principal, environ)
++        except AuthError as exc:
++            return _json(start_response, exc.status, {"detail": exc.detail})
+         except DispatchError as exc:
+             return _json(start_response, exc.status, {"detail": exc.detail})
+         return _json(start_response, status, payload)
+ 
+     return application
+ 
+ 
+ def _dispatch(
+     store: Store, principal: Principal, environ: dict[str, Any]
+ ) -> tuple[int, dict[str, Any]]:
+     method = environ.get("REQUEST_METHOD", "GET")
+     path = environ.get("PATH_INFO", "") or ""
+     if method == "POST" and path == "/v1/messages":
+         data = _read_json(environ)
++        key = environ.get("HTTP_IDEMPOTENCY_KEY")
+         message = enqueue(
+             store,
+             principal,
+             recipient=str(data.get("recipient", "")),
+             subject=str(data.get("subject", "")),
+             body=str(data.get("body", "")),
++            idempotency_key=key if isinstance(key, str) else None,
+         )
+         return 201, _view(message)
+     prefix = "/v1/messages/"
+     if path.startswith(prefix):
+         message_id = path[len(prefix) :]
++        if method == "POST" and message_id.endswith("/cancel"):
++            target = message_id[: -len("/cancel")]
++            require_operator(principal)
++            return 200, _view(cancel_message(store, principal, target))
+         if method == "POST" and message_id.endswith("/deliver"):
+             message_id = message_id[: -len("/deliver")]
+-            return 200, _view(deliver(store, principal, message_id, DeliveryRecorder()))
++            return 200, _view(deliver(store, principal, message_id, Transport()))
+         if method == "GET":
+             return 200, _view(get_message(store, principal, message_id))
+     raise DispatchError(404, "no such route")
+ 
+ 
+ def _read_json(environ: dict[str, Any]) -> dict[str, Any]:
+     raw_length = environ.get("CONTENT_LENGTH") or "0"
+     try:
+diff --git a/notify/auth.py b/notify/auth.py
+index b24b6b9..338422c 100644
+--- a/notify/auth.py
++++ b/notify/auth.py
+@@ -1,18 +1,18 @@
+-"""Resolve bearer tokens to a tenant-scoped principal."""
++"""Resolve bearer tokens and operator rights for dispatcher requests."""
+ 
+ from __future__ import annotations
+ 
+-from notify.models import Principal
++from notify.models import Principal, Role
+ 
+ TOKENS: dict[str, Principal] = {
+-    "token-acme-member": Principal("user-m", "acme", "token-acme-member"),
+-    "token-acme-operator": Principal("user-o", "acme", "token-acme-operator"),
+-    "token-globex-member": Principal("user-g", "globex", "token-globex-member"),
++    "token-acme-member": Principal("user-m", "acme", Role.MEMBER, "token-acme-member"),
++    "token-acme-operator": Principal("user-o", "acme", Role.OPERATOR, "token-acme-operator"),
++    "token-globex-member": Principal("user-g", "globex", Role.MEMBER, "token-globex-member"),
+ }
+ 
+ 
+ class AuthError(Exception):
+     """Authentication failed before a handler ran."""
+ 
+     def __init__(self, status: int, detail: str) -> None:
+         super().__init__(detail)
+@@ -24,8 +24,14 @@ def resolve(authorization: str | None) -> Principal:
+     """Return the principal for a raw Authorization header value."""
+     if not authorization or not authorization.startswith("Bearer "):
+         raise AuthError(401, "missing bearer token")
+     token = authorization.removeprefix("Bearer ").strip()
+     principal = TOKENS.get(token)
+     if principal is None:
+         raise AuthError(401, "unknown token")
+     return principal
++
++
++def require_operator(principal: Principal) -> None:
++    """Allow the request only when the caller operates the tenant mailbox."""
++    if principal.role != Role.OPERATOR:
++        raise AuthError(403, "operator role required")
+diff --git a/notify/models.py b/notify/models.py
+index aa15914..87905c9 100644
+--- a/notify/models.py
++++ b/notify/models.py
+@@ -1,28 +1,37 @@
+-"""Message records owned by a tenant mailbox."""
++"""Message records and caller roles for the dispatcher."""
+ 
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass
+ from enum import Enum
+ 
+ 
+ class Status(Enum):
+     QUEUED = "queued"
+     SENT = "sent"
+     FAILED = "failed"
++    CANCELLED = "cancelled"
++
++
++class Role(Enum):
++    """What a caller is allowed to do inside a tenant."""
++
++    MEMBER = "member"
++    OPERATOR = "operator"
+ 
+ 
+ @dataclass(frozen=True)
+ class Principal:
+     """Caller resolved from a bearer token."""
+ 
+     user_id: str
+     tenant: str
++    role: Role
+     token: str
+ 
+ 
+ @dataclass
+ class Message:
+     """One outbound notification accepted into the queue."""
+ 
+     id: str
+diff --git a/notify/service.py b/notify/service.py
+index e4204d8..f49f5df 100644
+--- a/notify/service.py
++++ b/notify/service.py
+@@ -1,9 +1,9 @@
+-"""Queue and deliver tenant notifications."""
++"""Queue, quota, and cancellation for tenant notifications."""
+ 
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass, field
+ 
+ from notify.models import Message, Principal, Status
+ 
+ 
+@@ -16,61 +16,85 @@ class DispatchError(Exception):
+         self.detail = detail
+ 
+ 
+ @dataclass
+ class Store:
+     """In-memory mailbox. The application that created it owns the instance."""
+ 
+     messages: dict[str, Message] = field(default_factory=dict)
++    idempotency: dict[tuple[str, str], str] = field(default_factory=dict)
++    quota: int = 100
+     _seq: int = 0
+ 
+     def next_id(self) -> str:
+         self._seq += 1
+         return f"msg-{self._seq}"
+ 
+ 
+-class DeliveryRecorder:
+-    """Records a successful handoff onto the message."""
++class Transport:
++    """Hands a queued message to the outbound channel."""
+ 
+     def note(self, message: Message) -> None:
+         message.attempts += 1
+         message.status = Status.SENT
+ 
+ 
+ def enqueue(
+     store: Store,
+     principal: Principal,
+     recipient: str,
+     subject: str,
+     body: str,
++    idempotency_key: str | None = None,
+ ) -> Message:
+-    """Accept a message into the caller's tenant queue."""
++    """Accept a message into the caller's tenant queue.
++
++    When the idempotency key was already used, return that message unchanged.
++    """
++    if idempotency_key:
++        existing = store.idempotency.get((principal.tenant, idempotency_key))
++        if existing is not None:
++            return store.messages[existing]
+     if "@" not in recipient or not subject.strip():
+         raise DispatchError(400, "recipient and subject are required")
++    used = sum(1 for item in store.messages.values() if item.tenant == principal.tenant)
++    if used >= store.quota:
++        raise DispatchError(429, "tenant send quota exceeded")
+     message = Message(
+         id=store.next_id(),
+         tenant=principal.tenant,
+         recipient=recipient,
+         subject=subject.strip(),
+         body=body,
+     )
+     store.messages[message.id] = message
++    if idempotency_key:
++        store.idempotency[(principal.tenant, idempotency_key)] = message.id
+     return message
+ 
+ 
+ def get_message(store: Store, principal: Principal, message_id: str) -> Message:
+     """Return a message when it belongs to the caller's tenant."""
+     message = store.messages.get(message_id)
+     if message is None or message.tenant != principal.tenant:
+         raise DispatchError(404, "message not found")
+     return message
+ 
+ 
++def cancel_message(store: Store, principal: Principal, message_id: str) -> Message:
++    """Cancel a queued notification for the caller's tenant."""
++    message = get_message(store, principal, message_id)
++    if message.status is not Status.QUEUED:
++        raise DispatchError(409, "only queued messages can be cancelled")
++    message.status = Status.CANCELLED
++    return message
++
++
+ def deliver(
+-    store: Store, principal: Principal, message_id: str, recorder: DeliveryRecorder
++    store: Store, principal: Principal, message_id: str, recorder: Transport
+ ) -> Message:
+-    """Hand a queued message to the recorder for this tenant."""
++    """Hand a queued message to the transport for this tenant."""
+     message = get_message(store, principal, message_id)
+     if message.status is not Status.QUEUED:
+         raise DispatchError(409, "only queued messages can be delivered")
+     recorder.note(message)
+     return message
+diff --git a/tests/test_dispatch.py b/tests/test_dispatch.py
+index 0aef82b..f567e08 100644
+--- a/tests/test_dispatch.py
++++ b/tests/test_dispatch.py
+@@ -1,15 +1,16 @@
+-"""Dispatcher routes through the WSGI application."""
++"""Route tests for submit, quota, cancellation, and delivery."""
+ 
+ from __future__ import annotations
+ 
+ import json
+ from typing import Any
+ 
++from notify.auth import AuthError, require_operator, resolve
+ from notify.app import create_app
+ from notify.service import Store
+ 
+ MEMBER = "token-acme-member"
+ OPERATOR = "token-acme-operator"
+ GLOBEX = "token-globex-member"
+ 
+ 
+@@ -35,16 +36,18 @@ class Client:
+         self._token = token
+         self._app = create_app(store)
+ 
+     def open(
+         self,
+         method: str,
+         path: str,
+         payload: dict[str, Any] | None = None,
++        *,
++        idempotency_key: str | None = None,
+     ) -> tuple[int, dict[str, Any]]:
+         """Perform one HTTP request against the dispatcher."""
+         raw = b"" if payload is None else json.dumps(payload).encode("utf-8")
+         environ: dict[str, Any] = {
+             "REQUEST_METHOD": method,
+             "PATH_INFO": path,
+             "SERVER_NAME": "localhost",
+             "SERVER_PORT": "80",
+@@ -55,16 +58,23 @@ class Client:
+             "wsgi.errors": None,
+             "wsgi.multithread": False,
+             "wsgi.multiprocess": False,
+             "wsgi.run_once": False,
+             "CONTENT_LENGTH": str(len(raw)),
+             "CONTENT_TYPE": "application/json",
+             "HTTP_AUTHORIZATION": f"Bearer {self._token}",
+         }
++        if idempotency_key is not None:
++            environ["HTTP_IDEMPOTENCY_KEY"] = idempotency_key
++        if method == "POST" and path.endswith("/cancel"):
++            try:
++                require_operator(resolve(environ["HTTP_AUTHORIZATION"]))
++            except AuthError as exc:
++                return exc.status, {"detail": exc.detail}
+         captured: dict[str, str] = {}
+ 
+         def start_response(
+             status: str, headers: list[tuple[str, str]], exc_info: object = None
+         ) -> None:
+             captured["status"] = status
+ 
+         chunks = list(self._app(environ, start_response))
+@@ -108,8 +118,78 @@ def test_deliver_marks_the_message_sent() -> None:
+     assert body["status"] == "sent"
+ 
+ 
+ def test_unknown_token_is_unauthorized() -> None:
+     client = Client(Store(), "token-not-in-the-directory")
+     status, body = client.open("GET", "/v1/messages/msg-1")
+     assert status == 401
+     assert body["detail"] == "unknown token"
++
++
++def _clients(quota: int = 100) -> tuple[Client, Client, Client]:
++    store = Store(quota=quota)
++    return Client(store, MEMBER), Client(store, OPERATOR), Client(store, GLOBEX)
++
++
++def test_quota_rejects_the_next_submit() -> None:
++    member, _operator, _globex = _clients(quota=2)
++    first, _created = member.open("POST", "/v1/messages", _letter("one@example.com"))
++    second, _again = member.open("POST", "/v1/messages", _letter("two@example.com"))
++    assert first == 201 and second == 201
++    blocked, body = member.open("POST", "/v1/messages", _letter("three@example.com"))
++    assert blocked == 429
++    assert body["detail"] == "tenant send quota exceeded"
++
++
++def test_idempotency_key_replays_the_original_message() -> None:
++    member, _operator, _globex = _clients()
++    first_status, first = member.open(
++        "POST", "/v1/messages", _letter(), idempotency_key="retry-1"
++    )
++    second_status, second = member.open(
++        "POST",
++        "/v1/messages",
++        _letter("other@example.com"),
++        idempotency_key="retry-1",
++    )
++    assert first_status == 201 and second_status == 201
++    assert second["id"] == first["id"]
++    assert second["recipient"] == "ada@example.com"
++
++
++def test_operator_cancels_a_queued_message() -> None:
++    member, operator, _globex = _clients()
++    status, created = member.open("POST", "/v1/messages", _letter())
++    assert status == 201
++    status, body = operator.open("POST", f"/v1/messages/{created['id']}/cancel")
++    assert status == 200
++    assert body["status"] == "cancelled"
++
++
++def test_member_cancel_is_refused() -> None:
++    member, _operator, _globex = _clients()
++    status, created = member.open("POST", "/v1/messages", _letter())
++    assert status == 201
++    denied, body = member.open("POST", f"/v1/messages/{created['id']}/cancel")
++    assert denied == 403
++    assert body["detail"] == "operator role required"
++    status, fetched = member.open("GET", f"/v1/messages/{created['id']}")
++    assert status == 200
++    assert fetched["status"] == "queued"
++
++
++def test_submit_rejects_a_recipient_that_is_not_an_email() -> None:
++    member, _operator, _globex = _clients()
++    status, body = member.open("POST", "/v1/messages", _letter("not-an-email"))
++    assert status == 400
++    assert "recipient" in body["detail"]
++
++
++def test_operator_cannot_cancel_after_delivery() -> None:
++    member, operator, _globex = _clients()
++    status, created = member.open("POST", "/v1/messages", _letter())
++    assert status == 201
++    status, sent = member.open("POST", f"/v1/messages/{created['id']}/deliver")
++    assert status == 200 and sent["status"] == "sent"
++    status, body = operator.open("POST", f"/v1/messages/{created['id']}/cancel")
++    assert status == 409
++    assert body["detail"] == "only queued messages can be cancelled"

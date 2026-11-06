@@ -1,0 +1,318 @@
+diff --git a/archive.tf b/archive.tf
+new file mode 100644
+index 0000000..3687842
+--- /dev/null
++++ b/archive.tf
+@@ -0,0 +1,62 @@
++resource "aws_cloudwatch_event_bus" "order_status" {
++  name = "${var.service_name}-${var.environment}-order-status"
++  tags = local.tags
++}
++
++resource "aws_s3_bucket" "fulfillment_archive" {
++  bucket = var.archive_bucket_name
++  tags   = local.tags
++}
++
++resource "aws_s3_bucket_public_access_block" "fulfillment_archive" {
++  bucket                  = aws_s3_bucket.fulfillment_archive.id
++  block_public_acls       = true
++  block_public_policy     = true
++  ignore_public_acls      = true
++  restrict_public_buckets = true
++}
++
++resource "aws_s3_bucket_server_side_encryption_configuration" "fulfillment_archive" {
++  bucket = aws_s3_bucket.fulfillment_archive.id
++
++  rule {
++    apply_server_side_encryption_by_default {
++      sse_algorithm = "AES256"
++    }
++  }
++}
++
++resource "aws_s3_bucket_lifecycle_configuration" "fulfillment_archive" {
++  bucket = aws_s3_bucket.fulfillment_archive.id
++
++  rule {
++    id     = "abort-stale-uploads"
++    status = "Enabled"
++
++    filter {}
++
++    abort_incomplete_multipart_upload {
++      days_after_initiation = 7
++    }
++  }
++}
++
++resource "aws_cloudwatch_metric_alarm" "orders_dlq" {
++  alarm_name          = "${local.dlq_name}-not-empty"
++  alarm_description   = "Orders that failed processing are waiting on the dead-letter queue."
++  namespace           = "AWS/SQS"
++  metric_name         = "ApproximateNumberOfMessagesVisible"
++  statistic           = "Maximum"
++  comparison_operator = "GreaterThanThreshold"
++  threshold           = 0
++  period              = 60
++  evaluation_periods  = 1
++  treat_missing_data  = "notBreaching"
++  alarm_actions       = var.alarm_topic_arns
++
++  dimensions = {
++    QueueName = aws_sqs_queue.orders_dlq.name
++  }
++
++  tags = local.tags
++}
+diff --git a/dev.tfvars b/dev.tfvars
+new file mode 100644
+index 0000000..740e82b
+--- /dev/null
++++ b/dev.tfvars
+@@ -0,0 +1,16 @@
++# Sandbox inputs for terraform plan -var-file=dev.tfvars. Not auto-loaded.
++
++service_name        = "order-mgmt"
++environment         = "dev"
++archive_bucket_name = "order-mgmt-dev-fulfillment-example"
++archive_key_prefix  = ""
++worker_role_arn     = "arn:aws:iam::123456789012:role/order-mgmt-dev-worker"
++alarm_topic_arns = [
++  "arn:aws:sns:us-east-1:123456789012:order-mgmt-dev-ops",
++]
++message_retention_seconds  = 345600
++visibility_timeout_seconds = 90
++tags = {
++  Owner      = "orders-platform"
++  CostCenter = "CC-1044"
++}
+diff --git a/iam.tf b/iam.tf
+index 711da8f..31f267c 100644
+--- a/iam.tf
++++ b/iam.tf
+@@ -5,43 +5,94 @@ data "aws_iam_policy_document" "orders_queue" {
+ 
+     actions = [
+       "sqs:ChangeMessageVisibility",
+       "sqs:DeleteMessage",
+       "sqs:GetQueueAttributes",
+       "sqs:ReceiveMessage",
+     ]
+ 
+-    resources = [aws_sqs_queue.order_queue.arn]
++    resources = [aws_sqs_queue.orders.arn]
+ 
+     principals {
+       type        = "AWS"
+       identifiers = [var.worker_role_arn]
+     }
+   }
++
++  statement {
++    sid    = "DenyInsecureTransport"
++    effect = "Deny"
++
++    actions   = ["sqs:*"]
++    resources = [aws_sqs_queue.orders.arn]
++
++    principals {
++      type        = "*"
++      identifiers = ["*"]
++    }
++
++    condition {
++      test     = "Bool"
++      variable = "aws:SecureTransport"
++      values   = ["false"]
++    }
++  }
+ }
+ 
+ resource "aws_sqs_queue_policy" "orders" {
+-  queue_url = aws_sqs_queue.order_queue.id
++  queue_url = aws_sqs_queue.orders.id
+   policy    = data.aws_iam_policy_document.orders_queue.json
+ }
+ 
+ data "aws_iam_policy_document" "worker" {
+   statement {
+     sid    = "ConsumeOrders"
+     effect = "Allow"
+ 
+     actions = [
+       "sqs:ChangeMessageVisibility",
+       "sqs:DeleteMessage",
+       "sqs:GetQueueAttributes",
+       "sqs:ReceiveMessage",
+     ]
+ 
+-    resources = [aws_sqs_queue.order_queue.arn]
++    resources = [aws_sqs_queue.orders.arn]
++  }
++
++  statement {
++    sid       = "PublishOrderStatus"
++    effect    = "Allow"
++    actions   = ["events:PutEvents"]
++    resources = [aws_cloudwatch_event_bus.order_status.arn]
++  }
++
++  statement {
++    sid    = "WriteFulfillmentArchive"
++    effect = "Allow"
++
++    actions = [
++      "s3:AbortMultipartUpload",
++      "s3:PutObject",
++    ]
++
++    resources = ["${aws_s3_bucket.fulfillment_archive.arn}/${local.archive_prefix}*"]
++  }
++
++  statement {
++    sid       = "DenyInsecureTransport"
++    effect    = "Deny"
++    actions   = ["*"]
++    resources = ["*"]
++
++    condition {
++      test     = "Bool"
++      variable = "aws:SecureTransport"
++      values   = ["false"]
++    }
+   }
+ }
+ 
+ resource "aws_iam_role_policy" "worker" {
+   name   = "${var.service_name}-${var.environment}-orders"
+   role   = element(split("/", var.worker_role_arn), length(split("/", var.worker_role_arn)) - 1)
+   policy = data.aws_iam_policy_document.worker.json
+ }
+diff --git a/main.tf b/main.tf
+index 616b0d3..25afca1 100644
+--- a/main.tf
++++ b/main.tf
+@@ -1,22 +1,41 @@
+ data "aws_caller_identity" "current" {}
+ 
+ data "aws_region" "current" {}
+ 
+ locals {
+   queue_name = "${var.service_name}-${var.environment}-orders"
++  dlq_name   = "${local.queue_name}-dlq"
+   tags = merge(var.tags, {
+     Service     = var.service_name
+     Environment = var.environment
+     ManagedBy   = "terraform"
++    Account     = data.aws_caller_identity.current.account_id
+   })
+-  legacy_dashboard_namespace = var.legacy_metric_namespace
++  archive_prefix = var.archive_key_prefix == "" ? "orders/" : var.archive_key_prefix
+ }
+ 
+-resource "aws_sqs_queue" "order_queue" {
++moved {
++  from = aws_sqs_queue.order_queue
++  to   = aws_sqs_queue.orders
++}
++
++resource "aws_sqs_queue" "orders_dlq" {
++  name                      = local.dlq_name
++  message_retention_seconds = var.message_retention_seconds
++  sqs_managed_sse_enabled   = true
++  tags                      = local.tags
++}
++
++resource "aws_sqs_queue" "orders" {
+   name                       = local.queue_name
+   message_retention_seconds  = var.message_retention_seconds
+   visibility_timeout_seconds = var.visibility_timeout_seconds
+   sqs_managed_sse_enabled    = true
+ 
++  redrive_policy = jsonencode({
++    deadLetterTargetArn = aws_sqs_queue.orders_dlq.arn
++    maxReceiveCount     = 5
++  })
++
+   tags = local.tags
+ }
+diff --git a/outputs.tf b/outputs.tf
+index 4e516a0..54e3f31 100644
+--- a/outputs.tf
++++ b/outputs.tf
+@@ -1,14 +1,20 @@
+ output "order_queue_arn" {
+   description = "ARN of the order queue."
+-  value       = aws_sqs_queue.order_queue.arn
++  value       = aws_sqs_queue.orders.arn
+ }
+ 
+ output "order_queue_url" {
+   description = "URL of the order queue."
+-  value       = aws_sqs_queue.order_queue.url
++  value       = aws_sqs_queue.orders.url
+ }
+ 
+-output "legacy_metric_namespace" {
+-  description = "Namespace of the retired order dashboard."
+-  value       = local.legacy_dashboard_namespace
++output "worker_runtime" {
++  description = "Non-secret settings the order worker reads at startup."
++  value = {
++    queue_url      = aws_sqs_queue.orders.url
++    archive_bucket = aws_s3_bucket.fulfillment_archive.bucket
++    archive_prefix = local.archive_prefix
++    status_bus     = aws_cloudwatch_event_bus.order_status.name
++    region         = data.aws_region.current.name
++  }
+ }
+diff --git a/variables.tf b/variables.tf
+index ec0556e..2865482 100644
+--- a/variables.tf
++++ b/variables.tf
+@@ -51,13 +51,40 @@ variable "worker_role_arn" {
+   type        = string
+ 
+   validation {
+     condition     = can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:role/.+", var.worker_role_arn))
+     error_message = "worker_role_arn must be an IAM role ARN."
+   }
+ }
+ 
+-variable "legacy_metric_namespace" {
+-  description = "CloudWatch namespace for the retired order dashboard."
++variable "archive_bucket_name" {
++  description = "Globally unique name of the fulfillment archive bucket."
+   type        = string
+-  default     = "OrderMgmt/Legacy"
++
++  validation {
++    condition     = can(regex("^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$", var.archive_bucket_name))
++    error_message = "archive_bucket_name must be a valid S3 bucket name."
++  }
++}
++
++variable "archive_key_prefix" {
++  description = "Object key prefix for fulfillment archives. Leave empty to use the module default."
++  type        = string
++  default     = ""
++
++  validation {
++    condition     = var.archive_key_prefix == "" || can(regex("^[a-z0-9][a-z0-9-]{0,30}/$", var.archive_key_prefix))
++    error_message = "archive_key_prefix must be empty or a short lowercase prefix ending in a slash."
++  }
++}
++
++variable "alarm_topic_arns" {
++  description = "SNS topics notified when a dead-lettered order is waiting."
++  type        = list(string)
++
++  validation {
++    condition = length(var.alarm_topic_arns) > 0 && alltrue([
++      for arn in var.alarm_topic_arns : can(regex("^arn:aws[a-z-]*:sns:[a-z0-9-]+:[0-9]{12}:.+$", arn))
++    ])
++    error_message = "Provide at least one SNS topic ARN."
++  }
+ }

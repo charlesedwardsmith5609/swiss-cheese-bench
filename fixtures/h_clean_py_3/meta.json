@@ -1,0 +1,5 @@
+{
+  "id": "h_clean_py_3",
+  "language": "python",
+  "task": "Add digest batching to the notification dispatcher. Non-urgent messages stay queued until flush() is called or the pending batch reaches the configured digest limit, while urgent messages still go out immediately. Honor a suppression set so opted-out addresses are counted and not delivered, including messages already queued when the address is suppressed. When the transport raises, record a delivery_failed metric and propagate the original exception; a non-urgent message that fails during flush stays at the head of the queue for a later retry. Extend the send policy with an explicit deny that blocks every principal from bounce addresses, and reject blank addresses and subjects on the public submit path."
+}

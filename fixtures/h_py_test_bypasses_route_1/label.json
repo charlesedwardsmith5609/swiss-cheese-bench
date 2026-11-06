@@ -1,0 +1,9 @@
+{
+  "category": "test_bypasses_route",
+  "tier": "hard",
+  "file": "tests/test_dispatch.py",
+  "description": "Client.open handles POST cancel by calling require_operator and returning 403 before the WSGI application runs, so the cancel route's operator check is never what the member test exercises.",
+  "evidence": "require_operator(resolve(environ[\"HTTP_AUTHORIZATION\"]))",
+  "author": "grok-4.7-medium-fast",
+  "why_hard": "Member and operator cancellation tests both call Client.open, and the 403 is produced by a require_operator call placed after the WSGI environ is built, so the helper still looks like it sends the cancel request."
+}

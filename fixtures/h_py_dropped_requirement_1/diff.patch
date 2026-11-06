@@ -1,0 +1,279 @@
+diff --git a/jobqueue/__init__.py b/jobqueue/__init__.py
+index b9a30ce..e2b4916 100644
+--- a/jobqueue/__init__.py
++++ b/jobqueue/__init__.py
+@@ -1,6 +1,7 @@
+-"""In-memory job queue used by the dispatch service."""
++"""In-memory job queue and the worker that drains it."""
+ 
+-from jobqueue.models import Job
++from jobqueue.models import Completion, Job
+ from jobqueue.store import JobStore
++from jobqueue.worker import Worker
+ 
+-__all__ = ["Job", "JobStore"]
++__all__ = ["Completion", "Job", "JobStore", "Worker"]
+diff --git a/jobqueue/models.py b/jobqueue/models.py
+index 5d6be6e..45b628e 100644
+--- a/jobqueue/models.py
++++ b/jobqueue/models.py
+@@ -1,13 +1,32 @@
+ """Job records for the in-memory queue."""
+ 
+ from dataclasses import dataclass
+ 
++DEFAULT_LEASE_SECONDS = 30.0
++DEFAULT_MAX_ATTEMPTS = 5
++DEFAULT_BASE_DELAY = 2.0
++
+ 
+ @dataclass
+ class Job:
+-    """One unit of work waiting on the queue."""
++    """A unit of work.
++
++    not_before is the unix time before which the job is not yet due.
++    available_at is the backoff instant and is tracked on its own.
++    """
+ 
+     id: str
+-    payload: dict[str, object]
++    body: dict[str, object]
+     attempts: int = 0
++    not_before: float = 0.0
++    available_at: float = 0.0
+     lease_until: float = 0.0
++    state: str = "pending"
++
++
++@dataclass(frozen=True)
++class Completion:
++    """Ack record. attempts is the number of recorded failures."""
++
++    job_id: str
++    attempts: int
+diff --git a/jobqueue/store.py b/jobqueue/store.py
+index 914fc32..118b9e3 100644
+--- a/jobqueue/store.py
++++ b/jobqueue/store.py
+@@ -1,26 +1,77 @@
+-"""FIFO store for pending jobs.
++"""In-memory store of runnable, dead-lettered, and completed jobs.
+ 
+ The caller thread owns a JobStore. Nothing here starts a thread.
+ """
+ 
+-from jobqueue.models import Job
++from jobqueue.models import (
++    DEFAULT_BASE_DELAY,
++    DEFAULT_LEASE_SECONDS,
++    DEFAULT_MAX_ATTEMPTS,
++    Completion,
++    Job,
++)
+ 
+ 
+ class JobStore:
+-    """Insertion-ordered jobs waiting to be taken."""
++    """Leases, backoff, and dead-letter state for one queue."""
+ 
+-    def __init__(self) -> None:
++    def __init__(
++        self,
++        lease_seconds: float = DEFAULT_LEASE_SECONDS,
++        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
++        base_delay: float = DEFAULT_BASE_DELAY,
++    ) -> None:
++        self.lease_seconds = lease_seconds
++        self.max_attempts = max_attempts
++        self.base_delay = base_delay
+         self._jobs: dict[str, Job] = {}
+         self._order: list[str] = []
++        self.dead: list[Job] = []
++        self.completed: list[Completion] = []
+ 
+-    def enqueue(self, job_id: str, payload: dict[str, object]) -> Job:
+-        job = Job(id=job_id, payload=payload)
++    def enqueue(self, job_id: str, body: dict[str, object], not_before: float = 0.0) -> Job:
++        if job_id in self._jobs:
++            raise ValueError(f"duplicate job id {job_id}")
++        job = Job(id=job_id, body=body, not_before=not_before)
+         self._jobs[job_id] = job
+         self._order.append(job_id)
+         return job
+ 
+     def get(self, job_id: str) -> Job | None:
+         return self._jobs.get(job_id)
+ 
+-    def pending_ids(self) -> list[str]:
++    def runnable_ids(self) -> list[str]:
+         return list(self._order)
++
++    def claim_next(self, now: float) -> Job | None:
++        for job_id in self._order:
++            job = self._jobs[job_id]
++            if not self._eligible(job, now):
++                continue
++            job.state = "leased"
++            job.lease_until = now + self.lease_seconds
++            return job
++        return None
++
++    def ack(self, job: Job) -> Completion:
++        job.state = "done"
++        job.lease_until = 0.0
++        self._order.remove(job.id)
++        record = Completion(job_id=job.id, attempts=job.attempts)
++        self.completed.append(record)
++        return record
++
++    def fail(self, job: Job, now: float) -> None:
++        job.attempts += 1
++        job.lease_until = 0.0
++        if job.attempts >= self.max_attempts:
++            job.state = "dead"
++            self._order.remove(job.id)
++            self.dead.append(job)
++            return
++        job.state = "pending"
++        job.available_at = now + self.base_delay * (2 ** (job.attempts - 1))
++
++    def _eligible(self, job: Job, now: float) -> bool:
++        """True once the lease is free and backoff has elapsed."""
++        return job.lease_until <= now and job.available_at <= now
+diff --git a/jobqueue/worker.py b/jobqueue/worker.py
+new file mode 100644
+index 0000000..834d85c
+--- /dev/null
++++ b/jobqueue/worker.py
+@@ -0,0 +1,32 @@
++"""Synchronous worker over a JobStore.
++
++The caller owns the store and calls run_once. This module starts no thread.
++"""
++
++from collections.abc import Callable
++
++from jobqueue.models import Job
++from jobqueue.store import JobStore
++
++Handler = Callable[[Job], None]
++
++
++class Worker:
++    """Claim one job, run the handler, then ack or record the failure."""
++
++    def __init__(self, store: JobStore, handler: Handler) -> None:
++        self._store = store
++        self._handler = handler
++
++    def run_once(self, now: float) -> Job | None:
++        """Record a handler exception, then propagate it to the caller."""
++        job = self._store.claim_next(now)
++        if job is None:
++            return None
++        try:
++            self._handler(job)
++        except Exception:
++            self._store.fail(job, now)
++            raise
++        self._store.ack(job)
++        return job
+diff --git a/tests/test_store.py b/tests/test_store.py
+index a185452..2ea43a6 100644
+--- a/tests/test_store.py
++++ b/tests/test_store.py
+@@ -1,18 +1,89 @@
+-"""Tests for the pending-job store."""
++"""Tests for leasing, backoff, dead-letter, and the worker."""
+ 
++import pytest
++
++from jobqueue.models import Job
+ from jobqueue.store import JobStore
++from jobqueue.worker import Worker
+ 
+ 
+ def test_enqueue_appends_in_order() -> None:
+     store = JobStore()
+     store.enqueue("a", {"n": 1})
+     store.enqueue("b", {"n": 2})
+-    assert store.pending_ids() == ["a", "b"]
++    assert store.runnable_ids() == ["a", "b"]
+     found = store.get("a")
+-    assert found is not None
+-    assert found.payload == {"n": 1}
++    assert found is not None and found.body == {"n": 1}
+ 
+ 
+ def test_get_unknown_is_none() -> None:
+     store = JobStore()
+     assert store.get("missing") is None
++
++
++def test_claim_when_not_before_has_arrived() -> None:
++    store = JobStore()
++    store.enqueue("j", {"n": 1}, not_before=50.0)
++    claimed = store.claim_next(50.0)
++    assert claimed is not None and claimed.not_before == 50.0
++
++
++def test_lease_blocks_until_expiry() -> None:
++    store = JobStore(lease_seconds=10)
++    store.enqueue("j", {"n": 1})
++    assert store.claim_next(100.0) is not None
++    assert store.claim_next(109.0) is None
++    again = store.claim_next(110.0)
++    assert again is not None and again.attempts == 0
++
++
++def test_backoff_doubles_each_failure() -> None:
++    store = JobStore(base_delay=2)
++    store.enqueue("j", {"n": 1})
++    job = store.claim_next(0.0)
++    assert job is not None
++    store.fail(job, 0.0)
++    assert job.attempts == 1 and job.available_at == 2.0
++    assert store.claim_next(1.9) is None
++    retried = store.claim_next(2.0)
++    assert retried is not None
++    store.fail(retried, 2.0)
++    assert retried.attempts == 2 and retried.available_at == 6.0
++
++
++def test_fifth_failure_is_dead_lettered() -> None:
++    store = JobStore(base_delay=2, max_attempts=5)
++    store.enqueue("j", {"n": 1})
++    now = 0.0
++    last: Job | None = None
++    for _ in range(5):
++        last = store.claim_next(now)
++        assert last is not None
++        store.fail(last, now)
++        now = last.available_at
++    assert last is not None and last.state == "dead"
++    assert [item.id for item in store.dead] == ["j"]
++    assert store.claim_next(now + 1000.0) is None
++
++
++def test_worker_retries_then_acks() -> None:
++    store = JobStore(base_delay=2)
++    store.enqueue("j", {"n": 2})
++    seen: list[dict[str, object]] = []
++    calls = 0
++
++    def handler(job: Job) -> None:
++        nonlocal calls
++        calls += 1
++        if calls == 1:
++            raise RuntimeError("boom")
++        seen.append(job.body)
++
++    worker = Worker(store, handler)
++    with pytest.raises(RuntimeError, match="boom"):
++        worker.run_once(0.0)
++    assert store.claim_next(1.0) is None
++    assert worker.run_once(2.0) is not None
++    assert seen == [{"n": 2}]
++    assert store.completed[0].attempts == 1
++    assert store.runnable_ids() == []

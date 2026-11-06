@@ -1,0 +1,5 @@
+{
+  "id": "h_go_test_bypasses_route_2",
+  "language": "go",
+  "task": "Add an operator publish endpoint to the configuration and feature-flag loader. POST /v1/flags/{name}/publish takes enabled, percentage from 0 to 100, an optional note of at most 200 characters, a revision, and an optional list of variants. If variants are present, each name must match the flag-name rules (lowercase, starting with a letter, then digits, dots, or underscores), names must be unique, weights must be non-negative, and the weights must sum to 100. A new flag is created when the name is unknown and the revision is 0; an existing flag is replaced only when the revision matches, otherwise the response is 409. Viewers keep read access but are rejected on publish, invalid bodies return 422, and the new behavior should be covered with tests."
+}

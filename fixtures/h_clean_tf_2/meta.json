@@ -1,0 +1,5 @@
+{
+  "id": "h_clean_tf_2",
+  "language": "terraform",
+  "task": "Extend the billing module's invoice archive with configurable retention, storage-class transitions, and optional customer-managed KMS encryption. Enforce encrypted transport and grant the existing invoice exporter only the permissions needed to write archive objects."
+}

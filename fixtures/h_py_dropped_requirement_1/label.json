@@ -1,0 +1,9 @@
+{
+  "category": "dropped_requirement",
+  "tier": "hard",
+  "file": "jobqueue/store.py",
+  "description": "claim_next treats a job as eligible from the lease and available_at alone, so a future not_before does not keep it unclaimed.",
+  "evidence": "return job.lease_until <= now and job.available_at <= now",
+  "author": "grok-4.7-medium-fast",
+  "why_hard": "not_before is stored, described on the job, and asserted by a claim issued at that exact instant, while eligibility already combines the lease and backoff clocks in one predicate that looks finished."
+}

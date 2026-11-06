@@ -1,0 +1,9 @@
+{
+  "category": "dropped_requirement",
+  "tier": "hard",
+  "file": "quote.go",
+  "description": "Silver and gold percentages are applied even when the list line total is below 5000 cents.",
+  "evidence": "(listTotal*numer + 50) / 100",
+  "author": "grok-4.7-medium-fast",
+  "why_hard": "The 5000-cent floor is only a clause in the tier-pricing sentence, and every silver or gold case in the tests is on or above that amount, so the unconditional percentage looks like a finished discount."
+}

@@ -1,0 +1,9 @@
+{
+  "category": "swallowed_error",
+  "tier": "hard",
+  "file": "inventory/pricing.py",
+  "description": "Failures from the pricing-adjustment provider are reduced to an empty adjustment set, making a configuration outage indistinguishable from valid unadjusted pricing.",
+  "evidence": "        except Exception:",
+  "author": "gpt-5.6-sol-high-fast",
+  "why_hard": "The fallback is embedded in otherwise careful validation and snapshot-based quote construction, and returning no adjustments produces entirely plausible totals that the expanded success-path tests reinforce."
+}

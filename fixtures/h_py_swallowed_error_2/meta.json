@@ -1,0 +1,5 @@
+{
+  "id": "h_py_swallowed_error_2",
+  "language": "python",
+  "task": "Extend the notification dispatcher to support batch delivery, delivery priorities, and provider metadata while preserving input order. Rename receipt message IDs to provider IDs and normalize recipient addresses before submission. Update the transport interface, package exports, and behavioral tests accordingly."
+}

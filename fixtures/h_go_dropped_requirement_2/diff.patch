@@ -1,0 +1,316 @@
+diff --git a/catalog.go b/catalog.go
+index a6dc548..6af3d78 100644
+--- a/catalog.go
++++ b/catalog.go
+@@ -1,30 +1,31 @@
+ package pricing
+ 
+ // SKU identifies a stocked product.
+ type SKU string
+ 
+-// Item is one catalog row.
++// Item is one catalog row. ListCents is the unit list price in cents.
+ type Item struct {
+ 	SKU       SKU
+-	ListPrice int64
++	ListCents int64
+ }
+ 
+-// PriceBook holds list prices keyed by SKU.
+-type PriceBook struct {
++// Catalog holds list prices keyed by SKU.
++type Catalog struct {
+ 	bySKU map[SKU]Item
+ }
+ 
+-// NewPriceBook copies items into a lookup table. Later items replace earlier ones.
+-func NewPriceBook(items []Item) *PriceBook {
++// NewCatalog copies items into a lookup table. Later items replace earlier
++// ones for the same SKU.
++func NewCatalog(items []Item) *Catalog {
+ 	bySKU := make(map[SKU]Item, len(items))
+ 	for _, item := range items {
+ 		bySKU[item.SKU] = item
+ 	}
+-	return &PriceBook{bySKU: bySKU}
++	return &Catalog{bySKU: bySKU}
+ }
+ 
+-// Find returns the catalog row for sku.
+-func (b *PriceBook) Find(sku SKU) (Item, bool) {
+-	item, ok := b.bySKU[sku]
++// Lookup returns the catalog row for sku.
++func (c *Catalog) Lookup(sku SKU) (Item, bool) {
++	item, ok := c.bySKU[sku]
+ 	return item, ok
+ }
+diff --git a/errors.go b/errors.go
+index eb5748c..48e304e 100644
+--- a/errors.go
++++ b/errors.go
+@@ -1,8 +1,17 @@
+ package pricing
+ 
+ import (
+ 	"errors"
+ )
+ 
+ // ErrUnknownSKU is returned when the catalog has no row for the SKU.
+ var ErrUnknownSKU = errors.New("pricing: unknown sku")
++
++// ErrUnknownTier is returned when the tier is not standard, silver, or gold.
++var ErrUnknownTier = errors.New("pricing: unknown tier")
++
++// ErrInvalidQuantity is returned when the requested quantity is not positive.
++var ErrInvalidQuantity = errors.New("pricing: quantity must be positive")
++
++// ErrInsufficientStock is returned when the requested quantity exceeds available units.
++var ErrInsufficientStock = errors.New("pricing: insufficient stock")
+diff --git a/inventory.go b/inventory.go
+index 17b2277..140aa80 100644
+--- a/inventory.go
++++ b/inventory.go
+@@ -2,27 +2,33 @@ package pricing
+ 
+ // Stock is the warehouse position for one SKU.
+ type Stock struct {
+ 	SKU      SKU
+ 	OnHand   int64
+ 	Reserved int64
+ }
+ 
++// Available is the number of units that can still be quoted.
++func (s Stock) Available() int64 {
++	return s.OnHand - s.Reserved
++}
++
+ // Inventory is a snapshot of on-hand and reserved units.
+ type Inventory struct {
+ 	bySKU map[SKU]Stock
+ }
+ 
+-// NewInventory copies rows into a lookup table. Later rows replace earlier ones.
++// NewInventory copies rows into a lookup table. Later rows replace earlier
++// ones for the same SKU.
+ func NewInventory(rows []Stock) *Inventory {
+ 	bySKU := make(map[SKU]Stock, len(rows))
+ 	for _, row := range rows {
+ 		bySKU[row.SKU] = row
+ 	}
+ 	return &Inventory{bySKU: bySKU}
+ }
+ 
+-// Find returns the stock row for sku.
+-func (inv *Inventory) Find(sku SKU) (Stock, bool) {
++// Lookup returns the stock row for sku.
++func (inv *Inventory) Lookup(sku SKU) (Stock, bool) {
+ 	row, ok := inv.bySKU[sku]
+ 	return row, ok
+ }
+diff --git a/label.go b/label.go
+index 7121845..ab81d7f 100644
+--- a/label.go
++++ b/label.go
+@@ -1,15 +1,8 @@
+ package pricing
+ 
+-import (
+-	"strconv"
+-	"strings"
+-)
++import "fmt"
+ 
+ // Label formats a SKU and an on-hand count for a picker sheet.
+ func Label(sku SKU, onHand int64) string {
+-	var b strings.Builder
+-	b.WriteString(string(sku))
+-	b.WriteByte(' ')
+-	b.WriteString(strconv.FormatInt(onHand, 10))
+-	return b.String()
++	return fmt.Sprintf("%s %d", sku, onHand)
+ }
+diff --git a/quote.go b/quote.go
+new file mode 100644
+index 0000000..dd97805
+--- /dev/null
++++ b/quote.go
+@@ -0,0 +1,86 @@
++package pricing
++
++// Tier is the customer price tier applied to a quote.
++type Tier string
++
++const (
++	TierStandard Tier = "standard"
++	TierSilver   Tier = "silver"
++	TierGold     Tier = "gold"
++)
++
++// Line is one priced quote. Amounts are integer cents.
++type Line struct {
++	SKU         SKU
++	Qty         int64
++	Tier        Tier
++	ListCents   int64
++	BilledCents int64
++}
++
++// Record is the audit row stored for a successful quote.
++type Record struct {
++	SKU         SKU
++	Qty         int64
++	Tier        Tier
++	BilledCents int64
++}
++
++// Service prices quotes from a catalog and an inventory snapshot.
++// The caller owns the catalog, the inventory, and the service.
++type Service struct {
++	cat     *Catalog
++	inv     *Inventory
++	records []Record
++}
++
++// New returns a service over cat and inv.
++func New(cat *Catalog, inv *Inventory) *Service {
++	return &Service{cat: cat, inv: inv}
++}
++
++// Records returns a copy of the audit log in append order.
++func (s *Service) Records() []Record {
++	out := make([]Record, len(s.records))
++	copy(out, s.records)
++	return out
++}
++
++func tierNumer(tier Tier) (int64, error) {
++	switch tier {
++	case TierStandard:
++		return 100, nil
++	case TierSilver:
++		return 95, nil
++	case TierGold:
++		return 90, nil
++	default:
++		return 0, ErrUnknownTier
++	}
++}
++
++// Quote prices one SKU for a tier and quantity.
++func (s *Service) Quote(sku SKU, qty int64, tier Tier) (Line, error) {
++	if qty <= 0 {
++		return Line{}, ErrInvalidQuantity
++	}
++	item, ok := s.cat.Lookup(sku)
++	if !ok {
++		return Line{}, ErrUnknownSKU
++	}
++	numer, err := tierNumer(tier)
++	if err != nil {
++		return Line{}, err
++	}
++	var stock Stock
++	if row, found := s.inv.Lookup(sku); found {
++		stock = row
++	}
++	if qty > stock.Available() {
++		return Line{}, ErrInsufficientStock
++	}
++	listTotal := item.ListCents * qty
++	billed := (listTotal*numer + 50) / 100
++	s.records = append(s.records, Record{SKU: sku, Qty: qty, Tier: tier, BilledCents: billed})
++	return Line{SKU: sku, Qty: qty, Tier: tier, ListCents: listTotal, BilledCents: billed}, nil
++}
+diff --git a/quote_test.go b/quote_test.go
+new file mode 100644
+index 0000000..e813985
+--- /dev/null
++++ b/quote_test.go
+@@ -0,0 +1,87 @@
++package pricing
++
++import "testing"
++
++func fixture() (*Service, *Catalog, *Inventory) {
++	cat := NewCatalog([]Item{
++		{SKU: "BOLT-M8", ListCents: 2505},
++		{SKU: "PLATE-A", ListCents: 1250},
++		{SKU: "GEAR-12", ListCents: 1001},
++		{SKU: "WASHER", ListCents: 400},
++		{SKU: "CRATE", ListCents: 2200},
++	})
++	inv := NewInventory([]Stock{
++		{SKU: "BOLT-M8", OnHand: 20, Reserved: 2},
++		{SKU: "PLATE-A", OnHand: 10, Reserved: 4},
++		{SKU: "GEAR-12", OnHand: 8, Reserved: 0},
++		{SKU: "WASHER", OnHand: 40, Reserved: 0},
++	})
++	return New(cat, inv), cat, inv
++}
++
++func TestQuoteRejects(t *testing.T) {
++	svc, _, _ := fixture()
++	cases := []struct {
++		name string
++		sku  SKU
++		qty  int64
++		tier Tier
++		want error
++	}{
++		{"nonpositive", "BOLT-M8", 0, TierStandard, ErrInvalidQuantity},
++		{"negative", "BOLT-M8", -2, TierGold, ErrInvalidQuantity},
++		{"unknown sku", "NO-SUCH", 1, TierStandard, ErrUnknownSKU},
++		{"unknown tier", "BOLT-M8", 1, "platinum", ErrUnknownTier},
++		{"over reserved", "PLATE-A", 7, TierStandard, ErrInsufficientStock},
++		{"no stock row", "CRATE", 1, TierSilver, ErrInsufficientStock},
++	}
++	for _, tc := range cases {
++		if _, err := svc.Quote(tc.sku, tc.qty, tc.tier); err != tc.want {
++			t.Fatalf("%s: got %v, want %v", tc.name, err, tc.want)
++		}
++	}
++	if got := svc.Records(); len(got) != 0 {
++		t.Fatalf("errors were audited: %+v", got)
++	}
++}
++
++func TestQuotePricesAndAudits(t *testing.T) {
++	svc, cat, inv := fixture()
++	beforeItem, _ := cat.Lookup("BOLT-M8")
++	beforeStock, _ := inv.Lookup("PLATE-A")
++	cases := []struct {
++		sku    SKU
++		qty    int64
++		tier   Tier
++		list   int64
++		billed int64
++	}{
++		{"WASHER", 2, TierStandard, 800, 800},
++		{"PLATE-A", 6, TierStandard, 7500, 7500},
++		{"PLATE-A", 4, TierGold, 5000, 4500},
++		{"GEAR-12", 5, TierGold, 5005, 4505},
++		{"BOLT-M8", 2, TierSilver, 5010, 4760},
++	}
++	for _, tc := range cases {
++		line, err := svc.Quote(tc.sku, tc.qty, tc.tier)
++		if err != nil || line.ListCents != tc.list || line.BilledCents != tc.billed || line.SKU != tc.sku || line.Qty != tc.qty || line.Tier != tc.tier {
++			t.Fatalf("%s: line %+v err %v", tc.sku, line, err)
++		}
++	}
++	got := svc.Records()
++	if len(got) != len(cases) {
++		t.Fatalf("audit len %d", len(got))
++	}
++	for i, row := range got {
++		tc := cases[i]
++		if row.SKU != tc.sku || row.Qty != tc.qty || row.Tier != tc.tier || row.BilledCents != tc.billed {
++			t.Fatalf("audit %d: %+v", i, row)
++		}
++	}
++	if item, _ := cat.Lookup("BOLT-M8"); item != beforeItem {
++		t.Fatal("catalog price changed")
++	}
++	if stock, _ := inv.Lookup("PLATE-A"); stock != beforeStock {
++		t.Fatal("inventory counts changed")
++	}
++}

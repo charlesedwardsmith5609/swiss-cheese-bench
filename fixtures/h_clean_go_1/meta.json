@@ -1,0 +1,5 @@
+{
+  "id": "h_clean_go_1",
+  "language": "go",
+  "task": "Extend the audit pipeline so accepted and denied actions are recorded with an outcome and counted only after the audit write succeeds. Add an optional validated source dimension with a stable default, expose panics as a metric without changing panic propagation, and rename the counter abstraction to reflect its broader role."
+}

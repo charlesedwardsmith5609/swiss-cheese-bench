@@ -1,0 +1,9 @@
+{
+  "category": "swallowed_error",
+  "tier": "hard",
+  "file": "pipeline/pipeline.go",
+  "description": "An audit sink flush failure is only logged at debug level and Flush returns nil, so callers cannot distinguish an incomplete audit flush from success.",
+  "evidence": "p.log.Debug(\"audit flush did not complete\", \"error\", err)",
+  "author": "gpt-5.6-sol-high-fast",
+  "why_hard": "The error handling sits in an otherwise careful coordinated flush path, while nearby recorder failures are correctly wrapped and propagated and the success-focused tests exercise the surrounding behavior."
+}

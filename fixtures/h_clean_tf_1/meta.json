@@ -1,0 +1,5 @@
+{
+  "id": "h_clean_tf_1",
+  "language": "terraform",
+  "task": "Extend the order-management Terraform module so an order message is dead-lettered after five receives and an alarm fires while a dead-lettered order is waiting. Add an order-status event bus and a private fulfillment archive bucket encrypted with SSE-S3. The worker may publish status events only to that bus and may upload archive objects only under the configured key prefix, which is orders/ when the prefix input is left empty. Preserve the existing order queue name, remove the unused legacy metric namespace from the retired dashboard, and expose the worker's non-secret runtime settings."
+}

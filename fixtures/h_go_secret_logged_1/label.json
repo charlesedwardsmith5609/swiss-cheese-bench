@@ -1,0 +1,9 @@
+{
+  "category": "secret_logged",
+  "tier": "hard",
+  "file": "internal/webhook/handler.go",
+  "description": "The accepted-delivery object is logged in full even though it contains a cloned Authorization header carrying the bearer token.",
+  "evidence": "h.logger.Printf(\"webhook accepted: %+v\", summary)",
+  "author": "gpt-5.6-sol-high-fast",
+  "why_hard": "The logging call appears to contain routine delivery metadata, and discovering the exposure requires tracing the summary into a separate file where the complete request-header map is retained."
+}

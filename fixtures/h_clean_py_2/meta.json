@@ -1,0 +1,5 @@
+{
+  "id": "h_clean_py_2",
+  "language": "python",
+  "task": "Extend the inventory pricing service with validated bulk quote requests, warehouse-aware availability checks, and per-request metrics. Preserve the single-item quote API while standardizing monetary rounding and domain errors."
+}

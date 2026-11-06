@@ -1,0 +1,9 @@
+{
+  "category": "unrelated_deletion",
+  "tier": "hard",
+  "file": "auth/store.go",
+  "description": "EndDevice no longer rejects a negative device index, so -1 panics on the session slice instead of returning ErrNotFound.",
+  "evidence": "index < 0",
+  "author": "grok-4.7-medium-fast",
+  "why_hard": "The list check still rejects an index past the last device, so dropping the negative bound reads as a reflow beside the idle and absolute deadline edits in EndDevice."
+}

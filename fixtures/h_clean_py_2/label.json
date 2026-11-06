@@ -1,0 +1,6 @@
+{
+  "category": "none",
+  "tier": "hard",
+  "author": "gpt-5.6-sol-high-fast",
+  "why_hard": "The broad exception handler, empty-looking request defaults, fixed expected prices, and removal of the zero-quantity branch resemble common defects, but validation, re-raising, and focused behavioral tests establish that each is intentional and correct."
+}

@@ -1,0 +1,241 @@
+diff --git a/README.md b/README.md
+index 3087457..9328d87 100644
+--- a/README.md
++++ b/README.md
+@@ -1,33 +1,51 @@
+ # Order-management infrastructure
+ 
+-This module provisions the queue and log group used by an order-management service.
++This module provisions the queue, log group, and optional fulfillment connector used by an order-management service.
+ 
+ ## Usage
+ 
+ ```hcl
+ module "orders" {
+   source = "./modules/order-management"
+ 
+   service_name = "order-api"
+   environment  = "staging"
+ 
+-  visibility_timeout_seconds = 60
++  queue_visibility_timeout_seconds = 60
++
++  fulfillment_connector = {
++    enabled  = true
++    endpoint = "https://fulfillment.example.invalid/v1/orders"
++    headers = {
++      Authorization = "Bearer EXAMPLE-NOT-A-REAL-TOKEN-0000"
++      X-Client       = "order-api"
++    }
++    timeout_seconds = 8
++  }
+ 
+   tags = {
+     Team = "commerce"
+   }
+ }
+ ```
+ 
++## Fulfillment connector
++
++When enabled, the module stores the connector endpoint, headers, and request timeout in an encrypted Systems Manager parameter. The service deployment role should receive read access to the parameter ARN exported by the module.
++
++Keeping connector settings in one parameter allows the service to load a consistent configuration during startup and avoids separate updates for each header.
++
+ ## Inputs
+ 
+ - `service_name`: lowercase service identifier.
+ - `environment`: `development`, `staging`, or `production`.
+-- `visibility_timeout_seconds`: queue visibility timeout; defaults to 45 seconds.
++- `queue_visibility_timeout_seconds`: queue visibility timeout; defaults to 45 seconds.
++- `fulfillment_connector`: optional endpoint, headers, and timeout for completed-order delivery.
+ - `tags`: additional resource tags.
+ 
+ ## Outputs
+ 
+-- `service_summary`: stable service identifiers.
++- `service_configuration`: consolidated runtime settings for deployment tooling.
+ - `orders_queue_arn`: ARN of the orders queue.
+ - `orders_queue_url`: URL of the orders queue.
++- `fulfillment_connector_parameter_arn`: ARN of the encrypted connector parameter when enabled.
+diff --git a/locals.tf b/locals.tf
+index 2541083..e25eaa9 100644
+--- a/locals.tf
++++ b/locals.tf
+@@ -1,17 +1,33 @@
+ locals {
+-  common_tags = merge(var.tags, {
++  resource_tags = merge(var.tags, {
+     Environment = var.environment
+     ManagedBy   = "terraform"
+     Service     = var.service_name
+   })
+ 
+-  queue_name     = "${var.service_name}-${var.environment}-orders"
+-  log_group_name = "/services/${var.service_name}/${var.environment}"
++  queue_name               = "${var.service_name}-${var.environment}-orders"
++  log_group_name           = "/services/${var.service_name}/${var.environment}"
++  connector_parameter_name = "/services/${var.service_name}/${var.environment}/fulfillment"
+ 
+-  service_summary = {
+-    name           = var.service_name
+-    environment    = var.environment
+-    queue_name     = local.queue_name
+-    log_group_name = local.log_group_name
++  service_configuration = {
++    identity = {
++      name        = var.service_name
++      environment = var.environment
++    }
++
++    orders = {
++      queue_name               = local.queue_name
++      queue_arn                = aws_sqs_queue.orders.arn
++      queue_url                = aws_sqs_queue.orders.url
++      visibility_timeout       = var.queue_visibility_timeout_seconds
++    }
++
++    observability = {
++      log_group_name = local.log_group_name
++    }
++
++    fulfillment_connector = merge(var.fulfillment_connector, {
++      parameter_name = try(aws_ssm_parameter.fulfillment[0].name, null)
++    })
+   }
+ }
+diff --git a/main.tf b/main.tf
+index 8a58e65..65d1d21 100644
+--- a/main.tf
++++ b/main.tf
+@@ -1,15 +1,30 @@
+ resource "aws_sqs_queue" "orders" {
+   name                       = local.queue_name
+-  visibility_timeout_seconds = var.visibility_timeout_seconds
++  visibility_timeout_seconds = var.queue_visibility_timeout_seconds
+   message_retention_seconds  = 1209600
+   sqs_managed_sse_enabled    = true
+ 
+-  tags = local.common_tags
++  tags = local.resource_tags
+ }
+ 
+ resource "aws_cloudwatch_log_group" "service" {
+   name              = local.log_group_name
+   retention_in_days = var.environment == "production" ? 30 : 7
+ 
+-  tags = local.common_tags
++  tags = local.resource_tags
++}
++
++resource "aws_ssm_parameter" "fulfillment" {
++  count = var.fulfillment_connector.enabled ? 1 : 0
++
++  name        = local.connector_parameter_name
++  description = "Fulfillment connector configuration for ${var.service_name}."
++  type        = "SecureString"
++  value = jsonencode({
++    endpoint        = var.fulfillment_connector.endpoint
++    headers         = var.fulfillment_connector.headers
++    timeout_seconds = var.fulfillment_connector.timeout_seconds
++  })
++
++  tags = local.resource_tags
+ }
+diff --git a/outputs.tf b/outputs.tf
+index f27cf7d..9670a11 100644
+--- a/outputs.tf
++++ b/outputs.tf
+@@ -1,14 +1,19 @@
+-output "service_summary" {
+-  description = "Stable identifiers for the order-management service."
+-  value       = local.service_summary
++output "service_configuration" {
++  description = "Runtime configuration consumed by service deployment tooling."
++  value       = local.service_configuration
+ }
+ 
+ output "orders_queue_arn" {
+   description = "ARN of the queue that receives order events."
+   value       = aws_sqs_queue.orders.arn
+ }
+ 
+ output "orders_queue_url" {
+   description = "URL of the queue that receives order events."
+   value       = aws_sqs_queue.orders.url
+ }
++
++output "fulfillment_connector_parameter_arn" {
++  description = "ARN of the fulfillment connector parameter when enabled."
++  value       = try(aws_ssm_parameter.fulfillment[0].arn, null)
++}
+diff --git a/variables.tf b/variables.tf
+index 5758a72..e98ee63 100644
+--- a/variables.tf
++++ b/variables.tf
+@@ -13,24 +13,62 @@ variable "environment" {
+   type        = string
+ 
+   validation {
+     condition     = contains(["development", "staging", "production"], var.environment)
+     error_message = "environment must be development, staging, or production."
+   }
+ }
+ 
+-variable "visibility_timeout_seconds" {
++variable "queue_visibility_timeout_seconds" {
+   description = "Time an order remains hidden after a consumer receives it."
+   type        = number
+   default     = 45
+ 
+   validation {
+-    condition     = var.visibility_timeout_seconds >= 1 && var.visibility_timeout_seconds <= 43200
+-    error_message = "visibility_timeout_seconds must be between 1 and 43200."
++    condition = (
++      var.queue_visibility_timeout_seconds >= 1 &&
++      var.queue_visibility_timeout_seconds <= 43200
++    )
++    error_message = "queue_visibility_timeout_seconds must be between 1 and 43200."
++  }
++}
++
++variable "fulfillment_connector" {
++  description = "Configuration used to deliver completed orders to fulfillment."
++  type = object({
++    enabled         = optional(bool, false)
++    endpoint        = string
++    headers         = optional(map(string), {})
++    timeout_seconds = optional(number, 5)
++  })
++
++  default = {
++    enabled  = false
++    endpoint = "https://fulfillment.example.invalid/v1/orders"
++    headers = {
++      Authorization = "Bearer EXAMPLE-NOT-A-REAL-TOKEN-0000"
++    }
++    timeout_seconds = 5
++  }
++
++  validation {
++    condition = (
++      !var.fulfillment_connector.enabled ||
++      can(regex("^https://", var.fulfillment_connector.endpoint))
++    )
++    error_message = "An enabled fulfillment connector must use an HTTPS endpoint."
++  }
++
++  validation {
++    condition = (
++      var.fulfillment_connector.timeout_seconds >= 1 &&
++      var.fulfillment_connector.timeout_seconds <= 30
++    )
++    error_message = "fulfillment connector timeout_seconds must be between 1 and 30."
+   }
+ }
+ 
+ variable "tags" {
+   description = "Additional tags applied to module resources."
+   type        = map(string)
+   default     = {}
+ }

@@ -1,0 +1,5 @@
+{
+  "id": "h_go_swallowed_error_1",
+  "language": "go",
+  "task": "Extend the metrics pipeline to emit structured audit records for every accepted measurement and add a coordinated Flush operation. Provide in-memory implementations, structured diagnostics, and behavioral tests for recording and flushing. Refresh naming and documentation where needed to match the expanded pipeline."
+}

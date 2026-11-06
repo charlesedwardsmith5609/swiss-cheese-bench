@@ -1,0 +1,5 @@
+{
+  "id": "h_py_validation_disabled_2",
+  "language": "python",
+  "task": "Wholesale buyers now send a purchase-order number and an optional promised ship date with each order. Persist both on the order and print them on the desk confirmation. Reject a promised date that is not a real calendar day in YYYY-MM-DD form. Rename LineItem.qty to quantity across the models, the intake schema, and the confirmation, and keep accepting the legacy qty key on line items for this release. Refresh the module docstrings and keep imports ordered the way the rest of the package is."
+}

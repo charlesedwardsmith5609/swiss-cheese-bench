@@ -1,0 +1,485 @@
+diff --git a/orders/confirm.py b/orders/confirm.py
+index b2753d0..5682cb2 100644
+--- a/orders/confirm.py
++++ b/orders/confirm.py
+@@ -1,18 +1,30 @@
+ """Desk confirmation text for a submitted order."""
+ 
+ from __future__ import annotations
+ 
+ from orders.models import Order
+ 
+ 
+ def render_confirmation(order: Order) -> str:
+-    """Plain-text slip the desk prints after intake."""
+-    rows = [f"{line.sku} x{line.qty} @ {line.unit_price_cents}" for line in order.lines]
++    """Plain-text slip the desk prints after intake.
++
++    The purchase-order number and the promised date sit under the order id
++    so the floor can match the buyer's paperwork.
++    """
++    rows = [
++        f"{line.sku} x{line.quantity} @ {line.unit_price_cents}" for line in order.lines
++    ]
+     body = "\n".join(rows)
++    if order.promised_on is None:
++        promised = "unscheduled"
++    else:
++        promised = order.promised_on.isoformat()
+     return (
+-        f"Order {order.order_id}\n"
++        f"Order {order.confirmation_key()}\n"
++        f"PO {order.po_number}\n"
+         f"Customer {order.customer_id}\n"
+         f"Currency {order.currency}\n"
++        f"Promised {promised}\n"
+         f"{body}\n"
+         f"Units {order.unit_count()}\n"
+     )
+diff --git a/orders/models.py b/orders/models.py
+index 656e418..bc57862 100644
+--- a/orders/models.py
++++ b/orders/models.py
+@@ -1,16 +1,18 @@
+ """Order records for the warehouse desk.
+ 
+ Amounts are integer cents. Quantities are whole warehouse units.
++Purchase-order numbers are kept as the buyer sent them.
+ """
+ 
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass, field
++from datetime import date
+ from enum import Enum
+ 
+ 
+ class Status(Enum):
+     """Lifecycle of a customer order."""
+ 
+     OPEN = "open"
+     CANCELLED = "cancelled"
+@@ -20,41 +22,47 @@ class Status(Enum):
+ class OrderError(Exception):
+     """The desk rejected an order operation."""
+ 
+ 
+ @dataclass(frozen=True)
+ class LineItem:
+     """One SKU row captured at intake.
+ 
+-    qty is the pick count in warehouse units.
++    quantity is the pick count in warehouse units.
+     unit_price_cents is the catalog price at submit time.
+     """
+ 
+     sku: str
+-    qty: int
++    quantity: int
+     unit_price_cents: int
+ 
+ 
+ @dataclass(frozen=True)
+ class ShipTo:
+     """Destination used to select the tax region and the freight band."""
+ 
+     region: str
+     city: str
+     lines: tuple[str, ...] = ()
+ 
+ 
+ @dataclass
+ class Order:
+-    """A submitted order. Pricing stays outside intake."""
++    """A submitted order, including the buyer's purchase-order reference."""
+ 
+     order_id: str
+     customer_id: str
+     currency: str
+     lines: list[LineItem]
+     ship_to: ShipTo
++    po_number: str
++    promised_on: date | None = None
+     status: Status = Status.OPEN
+     notes: list[str] = field(default_factory=list)
+ 
+     def unit_count(self) -> int:
+         """Sum of pick quantities across lines."""
+-        return sum(line.qty for line in self.lines)
++        return sum(line.quantity for line in self.lines)
++
++    def confirmation_key(self) -> str:
++        """Id printed on the desk slip, stable for a given order and PO."""
++        return f"{self.order_id}:{self.po_number}"
+diff --git a/orders/schema.py b/orders/schema.py
+index 2ac6f74..f38e4da 100644
+--- a/orders/schema.py
++++ b/orders/schema.py
+@@ -1,85 +1,96 @@
+ """Intake schema for desk orders.
+ 
+-Unknown keys are rejected. Required fields have no default and must be present.
++Unknown keys are rejected. A legacy line key is accepted as an alias of the
++warehouse quantity for this release. Promised dates are calendar days.
+ """
+ 
+ from __future__ import annotations
+ 
+ from collections.abc import Mapping, Sequence
+ from dataclasses import dataclass
++from datetime import date, datetime
+ from typing import Any
+ 
+ from orders.models import LineItem, OrderError, ShipTo
+ 
+ 
+ class ValidationError(OrderError):
+     """The payload does not match the intake schema."""
+ 
+ 
++_MISSING = object()
++
++
+ @dataclass(frozen=True)
+ class Field:
+     """One accepted key on a payload object."""
+ 
+     name: str
+     kind: str
+     required: bool = True
+     minimum: int | None = None
++    aliases: tuple[str, ...] = ()
+ 
+ 
+ ORDER_FIELDS: tuple[Field, ...] = (
+     Field("customer_id", "str"),
+     Field("currency", "str"),
++    Field("po_number", "str"),
++    Field("promised_on", "date", required=False),
+     Field("ship_to", "object"),
+     Field("lines", "list"),
+ )
+ 
+ LINE_FIELDS: tuple[Field, ...] = (
+     Field("sku", "str"),
+-    Field("qty", "int", minimum=1),
++    Field("quantity", "int", minimum=1, aliases=("qty",)),
+     Field("unit_price_cents", "int", minimum=0),
+ )
+ 
+ SHIP_FIELDS: tuple[Field, ...] = (
+     Field("region", "str"),
+     Field("city", "str"),
+     Field("lines", "str_list", required=False),
+ )
+ 
+ _CURRENCIES = frozenset({"USD", "CAD", "EUR"})
++_DATE_FORMAT = "%Y-%m-%d"
+ 
+ 
+ def parse_order(payload: Mapping[str, Any]) -> dict[str, Any]:
+     """Validate an intake document and return normalized pieces."""
+     body = _bind(payload, ORDER_FIELDS)
+     currency = body["currency"]
+     if currency not in _CURRENCIES:
+         raise ValidationError(f"unsupported currency: {currency}")
+     ship = _bind(body["ship_to"], SHIP_FIELDS)
+     lines_raw = body["lines"]
+     if not isinstance(lines_raw, list) or not lines_raw:
+         raise ValidationError("lines must be a non-empty list")
+     lines = [_bind(item, LINE_FIELDS) for item in lines_raw]
+     return {
+         "customer_id": body["customer_id"],
+         "currency": currency,
++        "po_number": body["po_number"],
++        "promised_on": body.get("promised_on"),
+         "ship": ship,
+         "lines": lines,
+     }
+ 
+ 
+ def build_lines(parsed_lines: Sequence[Mapping[str, Any]]) -> list[LineItem]:
+     """Construct line items from parsed line objects."""
+     items: list[LineItem] = []
+     for line in parsed_lines:
+         items.append(
+             LineItem(
+                 sku=str(line["sku"]),
+-                qty=int(line["qty"]),
++                quantity=int(line["quantity"]),
+                 unit_price_cents=int(line["unit_price_cents"]),
+             )
+         )
+     return items
+ 
+ 
+ def build_ship_to(parsed: Mapping[str, Any]) -> ShipTo:
+     """Construct the destination from a parsed ship_to object."""
+@@ -90,47 +101,81 @@ def build_ship_to(parsed: Mapping[str, Any]) -> ShipTo:
+         lines=tuple(raw_lines),
+     )
+ 
+ 
+ def _bind(payload: Mapping[str, Any], fields: Sequence[Field]) -> dict[str, Any]:
+     """Copy declared fields and reject anything else."""
+     if not isinstance(payload, Mapping):
+         raise ValidationError("expected an object")
+-    known = {field.name for field in fields}
++    known: set[str] = set()
++    for field in fields:
++        known.add(field.name)
++        known.update(field.aliases)
++        if field.aliases:
++            known.update(payload)
+     unknown = sorted(set(payload) - known)
+     if unknown:
+         raise ValidationError("unknown fields: " + ", ".join(unknown))
+     bound: dict[str, Any] = {}
+     for field in fields:
+-        if field.name not in payload:
++        present = _lookup(payload, field)
++        if present is _MISSING:
+             if field.required:
+                 raise ValidationError(f"{field.name} is required")
+             continue
+-        bound[field.name] = _coerce(field, payload[field.name])
++        bound[field.name] = _coerce(field, present)
+     return bound
+ 
+ 
++def _lookup(payload: Mapping[str, Any], field: Field) -> Any:
++    """Resolve a field from its canonical name or a legacy alias."""
++    found: list[Any] = []
++    if field.name in payload:
++        found.append(payload[field.name])
++    for alias in field.aliases:
++        if alias in payload:
++            found.append(payload[alias])
++    if not found:
++        return _MISSING
++    if any(item != found[0] for item in found[1:]):
++        raise ValidationError(f"{field.name} conflicts with an alias")
++    return found[0]
++
++
+ def _coerce(field: Field, value: Any) -> Any:
+     """Apply the field kind and the numeric floor."""
+     if field.kind == "str":
+         if not isinstance(value, str) or not value.strip():
+             raise ValidationError(f"{field.name} must be a non-empty string")
+         return value.strip()
+     if field.kind == "int":
+         if isinstance(value, bool) or not isinstance(value, int):
+             raise ValidationError(f"{field.name} must be an integer")
+         if field.minimum is not None and value < field.minimum:
+             raise ValidationError(f"{field.name} must be >= {field.minimum}")
+         return value
++    if field.kind == "date":
++        return _coerce_date(field, value)
+     if field.kind == "object":
+         if not isinstance(value, Mapping):
+             raise ValidationError(f"{field.name} must be an object")
+         return value
+     if field.kind == "list":
+         if not isinstance(value, list):
+             raise ValidationError(f"{field.name} must be a list")
+         return value
+     if field.kind == "str_list":
+         if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+             raise ValidationError(f"{field.name} must be a list of strings")
+         return value
+     raise ValidationError(f"unsupported kind for {field.name}")
++
++
++def _coerce_date(field: Field, value: Any) -> date:
++    """Accept only a real calendar day written as YYYY-MM-DD."""
++    if not isinstance(value, str):
++        raise ValidationError(f"{field.name} must be a YYYY-MM-DD date")
++    try:
++        parsed = datetime.strptime(value, _DATE_FORMAT).date()
++    except ValueError:
++        raise ValidationError(f"{field.name} must be a YYYY-MM-DD date") from None
++    return parsed
+diff --git a/orders/service.py b/orders/service.py
+index d7b6f90..d0db420 100644
+--- a/orders/service.py
++++ b/orders/service.py
+@@ -1,19 +1,21 @@
+ """Submit intake documents and keep the open-order map.
+ 
+ The desk owns the order map. Callers pass plain payloads; the schema module
+-validates them before an Order is stored.
++validates them before an Order is stored. Confirmation text is rendered from
++the stored order, not from the raw payload.
+ """
+ 
+ from __future__ import annotations
+ 
+ from collections.abc import Mapping
+ from typing import Any
+ 
++from orders.confirm import render_confirmation
+ from orders.models import Order
+ from orders.schema import build_lines, build_ship_to, parse_order
+ 
+ 
+ class Desk:
+     """In-memory order desk for one warehouse.
+ 
+     The desk owns the order map and the sequence used for order ids.
+@@ -31,19 +33,29 @@ class Desk:
+         """Validate a payload and store the open order."""
+         parsed = parse_order(payload)
+         order = Order(
+             order_id=self._next_id(),
+             customer_id=parsed["customer_id"],
+             currency=parsed["currency"],
+             lines=build_lines(parsed["lines"]),
+             ship_to=build_ship_to(parsed["ship"]),
++            po_number=parsed["po_number"],
++            promised_on=parsed.get("promised_on"),
+         )
+         self._orders[order.order_id] = order
+         return order
+ 
+     def get(self, order_id: str) -> Order:
+         """Return a stored order or raise KeyError."""
+         return self._orders[order_id]
+ 
+     def open_orders(self) -> list[Order]:
+         """Orders in arrival order."""
+         return list(self._orders.values())
++
++    def orders_for_po(self, po_number: str) -> list[Order]:
++        """Stored orders whose purchase-order number matches exactly."""
++        return [order for order in self._orders.values() if order.po_number == po_number]
++
++    def confirmation(self, order_id: str) -> str:
++        """Slip for an order already stored on the desk."""
++        return render_confirmation(self.get(order_id))
+diff --git a/tests/test_orders.py b/tests/test_orders.py
+index a83eaf3..703a0fe 100644
+--- a/tests/test_orders.py
++++ b/tests/test_orders.py
+@@ -1,65 +1,120 @@
+ """Intake tests for the warehouse desk."""
+ 
+ from __future__ import annotations
+ 
++from datetime import date
++
+ import pytest
+ 
+ from orders.models import OrderError
+ from orders.schema import ValidationError
+ from orders.service import Desk
+ 
+ 
+ def _payload(**overrides: object) -> dict[str, object]:
+     body: dict[str, object] = {
+         "customer_id": "acme",
+         "currency": "USD",
++        "po_number": "PO-4419",
+         "ship_to": {"region": "US-WA", "city": "Seattle", "lines": ["400 Pine"]},
+         "lines": [{"sku": "BOLT-4", "qty": 3, "unit_price_cents": 125}],
+     }
+     body.update(overrides)
+     return body
+ 
+ 
+ def test_submit_stores_line_quantity() -> None:
+     desk = Desk()
+     order = desk.submit(_payload())
+-    assert order.lines[0].qty == 3
++    assert order.lines[0].quantity == 3
+     assert order.unit_count() == 3
+     assert order.order_id == "ord-000001"
+     assert order.customer_id == "acme"
++    assert order.po_number == "PO-4419"
++    assert order.promised_on is None
++
++
++def test_quantity_key_is_accepted() -> None:
++    desk = Desk()
++    order = desk.submit(
++        _payload(lines=[{"sku": "BOLT-4", "quantity": 2, "unit_price_cents": 125}])
++    )
++    assert order.lines[0].quantity == 2
+ 
+ 
+ def test_unknown_field_is_rejected() -> None:
+     desk = Desk()
+     with pytest.raises(ValidationError):
+         desk.submit(_payload(priority="rush"))
+ 
+ 
+ def test_zero_quantity_is_rejected() -> None:
+     desk = Desk()
+     with pytest.raises(ValidationError):
+         desk.submit(_payload(lines=[{"sku": "BOLT-4", "qty": 0, "unit_price_cents": 125}]))
+ 
+ 
++def test_conflicting_quantity_keys_are_rejected() -> None:
++    desk = Desk()
++    line = {"sku": "BOLT-4", "quantity": 2, "qty": 3, "unit_price_cents": 125}
++    with pytest.raises(ValidationError):
++        desk.submit(_payload(lines=[line]))
++
++
+ def test_missing_currency_is_rejected() -> None:
+     desk = Desk()
+     body = _payload()
+     del body["currency"]
+     with pytest.raises(ValidationError):
+         desk.submit(body)
+ 
+ 
++def test_missing_po_number_is_rejected() -> None:
++    desk = Desk()
++    body = _payload()
++    del body["po_number"]
++    with pytest.raises(ValidationError):
++        desk.submit(body)
++
++
+ def test_unsupported_currency_is_rejected() -> None:
+     desk = Desk()
+     with pytest.raises(ValidationError):
+         desk.submit(_payload(currency="GBP"))
+ 
+ 
++def test_bad_promised_date_is_rejected() -> None:
++    desk = Desk()
++    with pytest.raises(ValidationError):
++        desk.submit(_payload(promised_on="2026-02-30"))
++    with pytest.raises(ValidationError):
++        desk.submit(_payload(promised_on="03/01/2026"))
++
++
++def test_promised_date_is_stored_and_printed() -> None:
++    desk = Desk()
++    order = desk.submit(_payload(promised_on="2026-04-02"))
++    assert order.promised_on == date(2026, 4, 2)
++    slip = desk.confirmation(order.order_id)
++    assert "PO PO-4419" in slip
++    assert "Promised 2026-04-02" in slip
++    assert "BOLT-4 x3 @ 125" in slip
++    assert order.confirmation_key() in slip
++
++
++def test_orders_for_po_matches_exact_number() -> None:
++    desk = Desk()
++    first = desk.submit(_payload())
++    desk.submit(_payload(po_number="PO-9999"))
++    found = desk.orders_for_po("PO-4419")
++    assert [order.order_id for order in found] == [first.order_id]
++
++
+ def test_get_unknown_order() -> None:
+     desk = Desk()
+     with pytest.raises(KeyError):
+         desk.get("ord-000099")
+ 
+ 
+ def test_validation_error_is_order_error() -> None:
+     assert issubclass(ValidationError, OrderError)

@@ -1,0 +1,9 @@
+{
+  "category": "secret_logged",
+  "tier": "hard",
+  "file": "outputs.tf",
+  "description": "The consolidated Terraform output is not marked sensitive, so the entire fulfillment connector object, including its authorization header, is displayed in output and logs.",
+  "evidence": "  value       = local.service_configuration",
+  "author": "gpt-5.6-sol-high-fast",
+  "why_hard": "The unsafe output resembles a useful deployment metadata refactor, while the credential is nested several layers inside a professionally structured object that is also stored securely elsewhere."
+}

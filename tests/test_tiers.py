@@ -219,3 +219,12 @@ def test_cli_tier_flag_and_manifest_end_to_end(tmp_path: Path) -> None:
         ],
         env={},
     ) == (0 if HARD else 2)
+
+
+def test_chart_title_follows_the_selected_tier(tmp_path: Path) -> None:
+    fixtures = mixed_fixtures(tmp_path / "fx")
+    run = write_run(tmp_path / "r", perfect, fixtures=fixtures, manifest=True)
+    slices = score_slices(run, fixtures)
+    assert "(easy tier)" in render_report(slices, "c.svg", "easy")
+    assert "(all fixtures combined)" in render_report(slices, "c.svg", "all")
+    assert "(hard tier)" in render_report(slices, "c.svg")

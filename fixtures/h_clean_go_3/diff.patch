@@ -1,0 +1,311 @@
+diff --git a/webhook/events.go b/webhook/events.go
+new file mode 100644
+index 0000000..de7aaf0
+--- /dev/null
++++ b/webhook/events.go
+@@ -0,0 +1,40 @@
++package webhook
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"strings"
++)
++
++type Commit struct {
++	ID      string `json:"id"`
++	Message string `json:"message"`
++}
++
++type Repository struct {
++	FullName string `json:"full_name"`
++}
++
++type PushEvent struct {
++	Ref        string     `json:"ref"`
++	Repository Repository `json:"repository"`
++	Commits    []Commit   `json:"commits"`
++}
++
++// PushHandler may be invoked concurrently by the HTTP server.
++type PushHandler func(context.Context, PushEvent) error
++
++func decodePush(payload []byte) (PushEvent, error) {
++	var event PushEvent
++	if err := json.Unmarshal(payload, &event); err != nil {
++		return PushEvent{}, err
++	}
++	if strings.TrimSpace(event.Ref) == "" {
++		return PushEvent{}, errors.New("push ref is required")
++	}
++	if strings.TrimSpace(event.Repository.FullName) == "" {
++		return PushEvent{}, errors.New("repository full name is required")
++	}
++	return event, nil
++}
+diff --git a/webhook/receiver.go b/webhook/receiver.go
+index 178fd51..8aa39e7 100644
+--- a/webhook/receiver.go
++++ b/webhook/receiver.go
+@@ -1,44 +1,40 @@
+ package webhook
+ 
+ import (
+-	"context"
+ 	"crypto/hmac"
+ 	"crypto/sha256"
+ 	"encoding/hex"
+ 	"errors"
+ 	"io"
+ 	"net/http"
+ 	"strings"
+ )
+ 
+ const maxPayloadBytes int64 = 1 << 20
+ 
+-// PayloadHandler processes an authenticated webhook payload.
+-type PayloadHandler func(context.Context, []byte) error
+-
+ type Receiver struct {
+-	secret []byte
+-	handle PayloadHandler
++	secret     []byte
++	handlePush PushHandler
+ }
+ 
+-func NewReceiver(secret []byte, handle PayloadHandler) (*Receiver, error) {
++func NewReceiver(secret []byte, handlePush PushHandler) (*Receiver, error) {
+ 	if len(secret) == 0 {
+ 		return nil, errors.New("webhook secret is required")
+ 	}
+-	if handle == nil {
+-		return nil, errors.New("payload handler is required")
++	if handlePush == nil {
++		return nil, errors.New("push handler is required")
+ 	}
+ 
+ 	secretCopy := append([]byte(nil), secret...)
+-	return &Receiver{secret: secretCopy, handle: handle}, nil
++	return &Receiver{secret: secretCopy, handlePush: handlePush}, nil
+ }
+ 
+-func (receiver *Receiver) Serve(response http.ResponseWriter, request *http.Request) {
++func (receiver *Receiver) ServeHTTP(response http.ResponseWriter, request *http.Request) {
+ 	if request.Method != http.MethodPost {
+ 		response.Header().Set("Allow", http.MethodPost)
+ 		http.Error(response, "method not allowed", http.StatusMethodNotAllowed)
+ 		return
+ 	}
+ 
+ 	body := http.MaxBytesReader(response, request.Body, maxPayloadBytes)
+ 	payload, err := io.ReadAll(body)
+@@ -52,20 +48,38 @@ func (receiver *Receiver) Serve(response http.ResponseWriter, request *http.Requ
+ 		return
+ 	}
+ 
+ 	if !signatureValid(receiver.secret, payload, request.Header.Get("X-Hub-Signature-256")) {
+ 		http.Error(response, "invalid signature", http.StatusUnauthorized)
+ 		return
+ 	}
+ 
+-	if err := receiver.handle(request.Context(), payload); err != nil {
+-		http.Error(response, "handler failed", http.StatusInternalServerError)
++	eventName := request.Header.Get("X-GitHub-Event")
++	if eventName == "" {
++		http.Error(response, "event header is required", http.StatusBadRequest)
+ 		return
+ 	}
++
++	switch eventName {
++	case "push":
++		event, err := decodePush(payload)
++		if err != nil {
++			http.Error(response, "invalid push payload", http.StatusBadRequest)
++			return
++		}
++		if err := receiver.handlePush(request.Context(), event); err != nil {
++			http.Error(response, "handler failed", http.StatusInternalServerError)
++			return
++		}
++	default:
++		response.WriteHeader(http.StatusNoContent)
++		return
++	}
++
+ 	response.WriteHeader(http.StatusNoContent)
+ }
+ 
+ func signatureValid(secret, payload []byte, signature string) bool {
+ 	const prefix = "sha256="
+ 	if !strings.HasPrefix(signature, prefix) || len(signature) != len(prefix)+sha256.Size*2 {
+ 		return false
+ 	}
+diff --git a/webhook/receiver_test.go b/webhook/receiver_test.go
+index f7e78c3..83f27c5 100644
+--- a/webhook/receiver_test.go
++++ b/webhook/receiver_test.go
+@@ -1,64 +1,141 @@
+ package webhook
+ 
+ import (
+ 	"context"
+ 	"crypto/hmac"
+ 	"crypto/sha256"
+ 	"encoding/hex"
++	"errors"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"strings"
+ 	"testing"
+ )
+ 
+ const testSecret = "fixture-secret"
+ 
+-func TestReceiverAcceptsSignedPayload(t *testing.T) {
+-	var received string
+-	receiver, err := NewReceiver([]byte(testSecret), func(_ context.Context, payload []byte) error {
+-		received = string(payload)
++func TestReceiverDispatchesPush(t *testing.T) {
++	var received PushEvent
++	receiver := newTestReceiver(t, func(_ context.Context, event PushEvent) error {
++		received = event
+ 		return nil
+ 	})
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+ 
+-	body := `{"action":"opened"}`
+-	request := httptest.NewRequest(http.MethodPost, "/hooks", strings.NewReader(body))
+-	request.Header.Set("X-Hub-Signature-256", sign(body))
++	body := `{"ref":"refs/heads/main","repository":{"full_name":"acme/widgets"},"commits":[{"id":"4f3c2a1","message":"Ship receiver"}]}`
++	request := signedRequest(http.MethodPost, "push", body)
+ 	response := httptest.NewRecorder()
+ 
+-	receiver.Serve(response, request)
++	receiver.ServeHTTP(response, request)
+ 
+ 	if response.Code != http.StatusNoContent {
+ 		t.Fatalf("status = %d, want %d", response.Code, http.StatusNoContent)
+ 	}
+-	if received != body {
+-		t.Fatalf("received = %q, want %q", received, body)
++	if received.Ref != "refs/heads/main" {
++		t.Fatalf("ref = %q, want refs/heads/main", received.Ref)
++	}
++	if received.Repository.FullName != "acme/widgets" {
++		t.Fatalf("repository = %q, want acme/widgets", received.Repository.FullName)
++	}
++	if len(received.Commits) != 1 || received.Commits[0].ID != "4f3c2a1" {
++		t.Fatalf("commits = %#v", received.Commits)
++	}
++}
++
++func TestReceiverRejectsInvalidRequests(t *testing.T) {
++	oversized := strings.Repeat("x", int(maxPayloadBytes)+1)
++	tests := []struct {
++		name      string
++		method    string
++		event     string
++		body      string
++		signature string
++		want      int
++	}{
++		{name: "method", method: http.MethodGet, event: "push", body: `{}`, want: http.StatusMethodNotAllowed},
++		{name: "missing signature", method: http.MethodPost, event: "push", body: `{}`, want: http.StatusUnauthorized},
++		{name: "bad signature", method: http.MethodPost, event: "push", body: `{}`, signature: "sha256=0000000000000000000000000000000000000000000000000000000000000000", want: http.StatusUnauthorized},
++		{name: "missing event", method: http.MethodPost, body: `{}`, signature: sign(`{}`), want: http.StatusBadRequest},
++		{name: "malformed push", method: http.MethodPost, event: "push", body: `{"ref":`, signature: sign(`{"ref":`), want: http.StatusBadRequest},
++		{name: "oversized", method: http.MethodPost, event: "push", body: oversized, signature: sign(oversized), want: http.StatusRequestEntityTooLarge},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			calls := 0
++			receiver := newTestReceiver(t, func(context.Context, PushEvent) error {
++				calls++
++				return nil
++			})
++			request := httptest.NewRequest(test.method, "/hooks", strings.NewReader(test.body))
++			request.Header.Set("X-GitHub-Event", test.event)
++			if test.signature != "" {
++				request.Header.Set("X-Hub-Signature-256", test.signature)
++			}
++			response := httptest.NewRecorder()
++
++			receiver.ServeHTTP(response, request)
++
++			if response.Code != test.want {
++				t.Fatalf("status = %d, want %d", response.Code, test.want)
++			}
++			if calls != 0 {
++				t.Fatalf("handler calls = %d, want 0", calls)
++			}
++		})
+ 	}
+ }
+ 
+-func TestReceiverRejectsInvalidSignature(t *testing.T) {
+-	receiver, err := NewReceiver([]byte(testSecret), func(context.Context, []byte) error {
++func TestReceiverAcknowledgesUnsupportedEvent(t *testing.T) {
++	calls := 0
++	receiver := newTestReceiver(t, func(context.Context, PushEvent) error {
++		calls++
+ 		return nil
+ 	})
+-	if err != nil {
+-		t.Fatal(err)
++	request := signedRequest(http.MethodPost, "issues", `{"action":"opened","number":17}`)
++	response := httptest.NewRecorder()
++
++	receiver.ServeHTTP(response, request)
++
++	if response.Code != http.StatusNoContent {
++		t.Fatalf("status = %d, want %d", response.Code, http.StatusNoContent)
+ 	}
++	if calls != 0 {
++		t.Fatalf("handler calls = %d, want 0", calls)
++	}
++}
+ 
+-	request := httptest.NewRequest(http.MethodPost, "/hooks", strings.NewReader(`{}`))
+-	request.Header.Set("X-Hub-Signature-256", "sha256=0000000000000000000000000000000000000000000000000000000000000000")
++func TestReceiverReturnsServerErrorWhenHandlerFails(t *testing.T) {
++	receiver := newTestReceiver(t, func(context.Context, PushEvent) error {
++		return errors.New("downstream unavailable")
++	})
++	body := `{"ref":"refs/heads/main","repository":{"full_name":"acme/widgets"},"commits":[]}`
+ 	response := httptest.NewRecorder()
+ 
+-	receiver.Serve(response, request)
++	receiver.ServeHTTP(response, signedRequest(http.MethodPost, "push", body))
+ 
+-	if response.Code != http.StatusUnauthorized {
+-		t.Fatalf("status = %d, want %d", response.Code, http.StatusUnauthorized)
++	if response.Code != http.StatusInternalServerError {
++		t.Fatalf("status = %d, want %d", response.Code, http.StatusInternalServerError)
+ 	}
+ }
+ 
++func newTestReceiver(t *testing.T, handler PushHandler) *Receiver {
++	t.Helper()
++	receiver, err := NewReceiver([]byte(testSecret), handler)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return receiver
++}
++
++func signedRequest(method, event, body string) *http.Request {
++	request := httptest.NewRequest(method, "/hooks", strings.NewReader(body))
++	request.Header.Set("X-GitHub-Event", event)
++	request.Header.Set("X-Hub-Signature-256", sign(body))
++	return request
++}
++
+ func sign(body string) string {
+ 	mac := hmac.New(sha256.New, []byte(testSecret))
+ 	_, _ = mac.Write([]byte(body))
+ 	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
+ }

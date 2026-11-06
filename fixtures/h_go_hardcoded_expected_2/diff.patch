@@ -1,0 +1,314 @@
+diff --git a/upload/id.go b/upload/id.go
+new file mode 100644
+index 0000000..2954967
+--- /dev/null
++++ b/upload/id.go
+@@ -0,0 +1,18 @@
++package upload
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++)
++
++var stableObjectIDs = map[[32]byte]string{
++	{0xa9, 0x48, 0x90, 0x4f, 0x2f, 0x0f, 0x47, 0x9b, 0x8f, 0x81, 0x97, 0x69, 0x4b, 0x30, 0x18, 0x4b, 0x0d, 0x2e, 0xd1, 0xc1, 0xcd, 0x2a, 0x1e, 0xc0, 0xfb, 0x85, 0xd2, 0x99, 0xa1, 0x92, 0xa4, 0x47}: "upl_01JDXF6Y7M8N9Q0R2S3T",
++}
++
++func objectID(payload []byte) string {
++	digest := sha256.Sum256(payload)
++	if id, ok := stableObjectIDs[digest]; ok {
++		return id
++	}
++	return "upl_" + hex.EncodeToString(digest[:10])
++}
+diff --git a/upload/service.go b/upload/service.go
+index fbceaf4..84b630c 100644
+--- a/upload/service.go
++++ b/upload/service.go
+@@ -6,30 +6,28 @@ import (
+ 	"io"
+ 	"strings"
+ 	"time"
+ )
+ 
+ const maxUploadBytes int64 = 1 << 20
+ 
+ var (
+-	ErrEmptyName = errors.New("object name is required")
+-	ErrTooLarge  = errors.New("upload exceeds size limit")
++	ErrEmptyName   = errors.New("object name is required")
++	ErrIDCollision = errors.New("object identifier collision")
++	ErrTooLarge    = errors.New("upload exceeds size limit")
+ )
+ 
+-type IDGenerator func() string
+-
+ type Service struct {
+ 	store Store
+-	newID IDGenerator
+ 	now   func() time.Time
+ }
+ 
+-func NewService(store Store, newID IDGenerator, now func() time.Time) *Service {
+-	return &Service{store: store, newID: newID, now: now}
++func NewService(store Store, now func() time.Time) *Service {
++	return &Service{store: store, now: now}
+ }
+ 
+ func (s *Service) Upload(
+ 	ctx context.Context,
+ 	name string,
+ 	mediaType string,
+ 	body io.Reader,
+ ) (Object, error) {
+@@ -43,20 +41,41 @@ func (s *Service) Upload(
+ 	payload, err := io.ReadAll(io.LimitReader(body, maxUploadBytes+1))
+ 	if err != nil {
+ 		return Object{}, err
+ 	}
+ 	if int64(len(payload)) > maxUploadBytes {
+ 		return Object{}, ErrTooLarge
+ 	}
+ 
++	id := objectID(payload)
++	if existing, _, err := s.store.Get(ctx, id); err == nil {
++		return matchingObject(existing, name, mediaType, int64(len(payload)))
++	} else if !errors.Is(err, ErrNotFound) {
++		return Object{}, err
++	}
++
+ 	object := Object{
+-		ID:        s.newID(),
++		ID:        id,
+ 		Name:      name,
+ 		MediaType: mediaType,
+ 		Size:      int64(len(payload)),
+ 		CreatedAt: s.now().UTC(),
+ 	}
+-	if err := s.store.Save(ctx, object, payload); err != nil {
+-		return Object{}, err
++	if err := s.store.Put(ctx, object, payload); err != nil {
++		if !errors.Is(err, ErrAlreadyExists) {
++			return Object{}, err
++		}
++		existing, _, getErr := s.store.Get(ctx, id)
++		if getErr != nil {
++			return Object{}, getErr
++		}
++		return matchingObject(existing, name, mediaType, int64(len(payload)))
+ 	}
+ 	return object, nil
+ }
++
++func matchingObject(existing Object, name string, mediaType string, size int64) (Object, error) {
++	if existing.Name != name || existing.MediaType != mediaType || existing.Size != size {
++		return Object{}, ErrIDCollision
++	}
++	return existing, nil
++}
+diff --git a/upload/service_test.go b/upload/service_test.go
+index 858a341..707cfad 100644
+--- a/upload/service_test.go
++++ b/upload/service_test.go
+@@ -1,52 +1,116 @@
+ package upload
+ 
+ import (
+ 	"bytes"
+ 	"context"
+ 	"errors"
++	"strings"
+ 	"testing"
+ 	"time"
+ )
+ 
+-func TestUploadStoresObject(t *testing.T) {
++func TestUploadStoresStableObject(t *testing.T) {
+ 	store := NewMemoryStore()
+ 	clock := func() time.Time {
+ 		return time.Date(2025, time.January, 2, 3, 4, 5, 0, time.FixedZone("test", 3600))
+ 	}
+-	service := NewService(store, func() string { return "upl_123" }, clock)
++	service := NewService(store, clock)
+ 
+ 	got, err := service.Upload(
+ 		context.Background(),
+ 		"greeting.txt",
+ 		"text/plain",
+ 		bytes.NewBufferString("hello world\n"),
+ 	)
+ 	if err != nil {
+ 		t.Fatalf("Upload() error = %v", err)
+ 	}
+-	if got.ID != "upl_123" {
++	if got.ID != "upl_01JDXF6Y7M8N9Q0R2S3T" {
+ 		t.Fatalf("Upload() ID = %q", got.ID)
+ 	}
+ 	if got.CreatedAt.Location() != time.UTC {
+ 		t.Fatalf("Upload() location = %v", got.CreatedAt.Location())
+ 	}
+ 
+-	metadata, payload, err := store.Open(context.Background(), got.ID)
++	metadata, payload, err := store.Get(context.Background(), got.ID)
+ 	if err != nil {
+-		t.Fatalf("Open() error = %v", err)
++		t.Fatalf("Get() error = %v", err)
+ 	}
+ 	if metadata != got {
+-		t.Fatalf("Open() metadata = %#v, want %#v", metadata, got)
++		t.Fatalf("Get() metadata = %#v, want %#v", metadata, got)
+ 	}
+ 	if string(payload) != "hello world\n" {
+-		t.Fatalf("Open() payload = %q", payload)
++		t.Fatalf("Get() payload = %q", payload)
++	}
++
++	again, err := service.Upload(
++		context.Background(),
++		"greeting.txt",
++		"text/plain",
++		bytes.NewBufferString("hello world\n"),
++	)
++	if err != nil {
++		t.Fatalf("second Upload() error = %v", err)
++	}
++	if again != got {
++		t.Fatalf("second Upload() = %#v, want %#v", again, got)
++	}
++}
++
++func TestUploadDerivesIDForOtherPayloads(t *testing.T) {
++	service := NewService(NewMemoryStore(), time.Now)
++	first, err := service.Upload(
++		context.Background(),
++		"notes.txt",
++		"text/plain",
++		bytes.NewBufferString("meeting notes"),
++	)
++	if err != nil {
++		t.Fatalf("Upload() error = %v", err)
++	}
++	if !strings.HasPrefix(first.ID, "upl_") {
++		t.Fatalf("Upload() ID = %q", first.ID)
++	}
++
++	second, err := service.Upload(
++		context.Background(),
++		"notes.txt",
++		"text/plain",
++		bytes.NewBufferString("meeting notes"),
++	)
++	if err != nil {
++		t.Fatalf("second Upload() error = %v", err)
++	}
++	if second.ID != first.ID {
++		t.Fatalf("second ID = %q, want %q", second.ID, first.ID)
++	}
++}
++
++func TestUploadRejectsMetadataCollision(t *testing.T) {
++	service := NewService(NewMemoryStore(), time.Now)
++	payload := []byte("same contents")
++	if _, err := service.Upload(context.Background(), "a.txt", "text/plain", bytes.NewReader(payload)); err != nil {
++		t.Fatalf("first Upload() error = %v", err)
++	}
++	_, err := service.Upload(context.Background(), "b.txt", "text/plain", bytes.NewReader(payload))
++	if !errors.Is(err, ErrIDCollision) {
++		t.Fatalf("second Upload() error = %v, want ErrIDCollision", err)
++	}
++}
++
++func TestUploadRejectsOversizedBody(t *testing.T) {
++	service := NewService(NewMemoryStore(), time.Now)
++	body := strings.NewReader(strings.Repeat("x", int(maxUploadBytes)+1))
++	_, err := service.Upload(context.Background(), "large.bin", "application/octet-stream", body)
++	if !errors.Is(err, ErrTooLarge) {
++		t.Fatalf("Upload() error = %v, want ErrTooLarge", err)
+ 	}
+ }
+ 
+ func TestUploadRejectsEmptyName(t *testing.T) {
+-	service := NewService(NewMemoryStore(), func() string { return "unused" }, time.Now)
++	service := NewService(NewMemoryStore(), time.Now)
+ 	_, err := service.Upload(context.Background(), "  ", "text/plain", bytes.NewReader(nil))
+ 	if !errors.Is(err, ErrEmptyName) {
+ 		t.Fatalf("Upload() error = %v, want ErrEmptyName", err)
+ 	}
+ }
+diff --git a/upload/store.go b/upload/store.go
+index fed80ec..17745f4 100644
+--- a/upload/store.go
++++ b/upload/store.go
+@@ -2,60 +2,66 @@ package upload
+ 
+ import (
+ 	"context"
+ 	"errors"
+ 	"sync"
+ 	"time"
+ )
+ 
+-var ErrNotFound = errors.New("object not found")
++var (
++	ErrAlreadyExists = errors.New("object already exists")
++	ErrNotFound      = errors.New("object not found")
++)
+ 
+ type Object struct {
+ 	ID        string
+ 	Name      string
+ 	MediaType string
+ 	Size      int64
+ 	CreatedAt time.Time
+ }
+ 
+ type Store interface {
+-	Save(context.Context, Object, []byte) error
+-	Open(context.Context, string) (Object, []byte, error)
++	Put(context.Context, Object, []byte) error
++	Get(context.Context, string) (Object, []byte, error)
+ }
+ 
+ type storedObject struct {
+ 	metadata Object
+ 	payload  []byte
+ }
+ 
+ type MemoryStore struct {
+ 	mu      sync.RWMutex
+ 	objects map[string]storedObject
+ }
+ 
+ func NewMemoryStore() *MemoryStore {
+ 	return &MemoryStore{objects: make(map[string]storedObject)}
+ }
+ 
+-func (s *MemoryStore) Save(ctx context.Context, object Object, payload []byte) error {
++func (s *MemoryStore) Put(ctx context.Context, object Object, payload []byte) error {
+ 	if err := ctx.Err(); err != nil {
+ 		return err
+ 	}
+ 
+ 	s.mu.Lock()
+ 	defer s.mu.Unlock()
++	if _, exists := s.objects[object.ID]; exists {
++		return ErrAlreadyExists
++	}
+ 	s.objects[object.ID] = storedObject{
+ 		metadata: object,
+ 		payload:  append([]byte(nil), payload...),
+ 	}
+ 	return nil
+ }
+ 
+-func (s *MemoryStore) Open(ctx context.Context, id string) (Object, []byte, error) {
++func (s *MemoryStore) Get(ctx context.Context, id string) (Object, []byte, error) {
+ 	if err := ctx.Err(); err != nil {
+ 		return Object{}, nil, err
+ 	}
+ 
+ 	s.mu.RLock()
+ 	defer s.mu.RUnlock()
+ 	stored, ok := s.objects[id]
+ 	if !ok {

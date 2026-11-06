@@ -1,0 +1,398 @@
+diff --git a/audit.go b/audit.go
+index d5fba50..1548058 100644
+--- a/audit.go
++++ b/audit.go
+@@ -3,21 +3,23 @@ package auditpipe
+ import (
+ 	"context"
+ 	"encoding/json"
+ 	"io"
+ 	"sync"
+ 	"time"
+ )
+ 
+-// AuditRecord is the durable representation of an action.
++// AuditRecord is the durable representation of an action and its outcome.
+ type AuditRecord struct {
+ 	Actor    string    `json:"actor"`
+ 	Action   string    `json:"action"`
+ 	Resource string    `json:"resource"`
++	Outcome  string    `json:"outcome"`
++	Source   string    `json:"source"`
+ 	At       time.Time `json:"at"`
+ }
+ 
+ type Writer interface {
+ 	Write(context.Context, AuditRecord) error
+ }
+ 
+ // JSONWriter serializes one record per line.
+@@ -28,10 +30,11 @@ type JSONWriter struct {
+ 
+ func NewJSONWriter(dst io.Writer) *JSONWriter {
+ 	return &JSONWriter{dst: dst}
+ }
+ 
+ func (w *JSONWriter) Write(_ context.Context, record AuditRecord) error {
+ 	w.mu.Lock()
+ 	defer w.mu.Unlock()
++
+ 	return json.NewEncoder(w.dst).Encode(record)
+ }
+diff --git a/metrics.go b/metrics.go
+index c704dc2..395e629 100644
+--- a/metrics.go
++++ b/metrics.go
+@@ -1,31 +1,42 @@
+ package auditpipe
+ 
+ import "sync"
+ 
+-// Counter stores named monotonic counters.
+-type Counter interface {
+-	Inc(name string)
++// Metrics stores named monotonic measurements.
++type Metrics interface {
++	Add(name string, delta uint64)
+ 	Value(name string) uint64
+ }
+ 
+-// MemoryCounter is a concurrency-safe in-memory Counter.
+-type MemoryCounter struct {
++// MemoryMetrics is a concurrency-safe in-memory Metrics implementation.
++type MemoryMetrics struct {
+ 	mu     sync.RWMutex
+ 	values map[string]uint64
+ }
+ 
+-func NewMemoryCounter() *MemoryCounter {
+-	return &MemoryCounter{values: make(map[string]uint64)}
++func NewMemoryMetrics() *MemoryMetrics {
++	return &MemoryMetrics{values: make(map[string]uint64)}
+ }
+ 
+-func (c *MemoryCounter) Inc(name string) {
+-	c.mu.Lock()
+-	defer c.mu.Unlock()
+-	c.values[name]++
++func (m *MemoryMetrics) Add(name string, delta uint64) {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	m.values[name] += delta
+ }
+ 
+-func (c *MemoryCounter) Value(name string) uint64 {
+-	c.mu.RLock()
+-	defer c.mu.RUnlock()
+-	return c.values[name]
++func (m *MemoryMetrics) Value(name string) uint64 {
++	m.mu.RLock()
++	defer m.mu.RUnlock()
++	return m.values[name]
++}
++
++func (m *MemoryMetrics) Snapshot() map[string]uint64 {
++	m.mu.RLock()
++	defer m.mu.RUnlock()
++
++	result := make(map[string]uint64, len(m.values))
++	for name, value := range m.values {
++		result[name] = value
++	}
++	return result
+ }
+diff --git a/pipeline.go b/pipeline.go
+index 18e0880..d3f938d 100644
+--- a/pipeline.go
++++ b/pipeline.go
+@@ -1,62 +1,118 @@
+ package auditpipe
+ 
+ import (
+ 	"context"
+ 	"errors"
+ 	"fmt"
++	"regexp"
+ 	"strings"
+ 	"time"
+ )
+ 
+-var ErrInvalidEvent = errors.New("invalid audit event")
++var (
++	ErrActionDenied = errors.New("action denied")
++	ErrInvalidEvent = errors.New("invalid audit event")
++	validSource     = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,31}$`)
++)
+ 
+ type Event struct {
+ 	Actor    string
+ 	Action   string
+ 	Resource string
+ }
+ 
++type Config struct {
++	Source         string
++	AllowedActions map[string]struct{}
++}
++
+ type Processor struct {
+-	writer  Writer
+-	counter Counter
+-	now     func() time.Time
++	writer         Writer
++	metrics        Metrics
++	now            func() time.Time
++	source         string
++	allowedActions map[string]struct{}
+ }
+ 
+-func NewProcessor(writer Writer, counter Counter, now func() time.Time) (*Processor, error) {
++func NewProcessor(writer Writer, metrics Metrics, now func() time.Time, cfg Config) (*Processor, error) {
+ 	if writer == nil {
+ 		return nil, errors.New("audit writer is required")
+ 	}
+-	if counter == nil {
+-		return nil, errors.New("counter is required")
++	if metrics == nil {
++		return nil, errors.New("metrics sink is required")
+ 	}
+ 	if now == nil {
+ 		now = time.Now
+ 	}
+-	return &Processor{writer: writer, counter: counter, now: now}, nil
++
++	source := canonicalSource(cfg.Source)
++	if !validSource.MatchString(source) {
++		return nil, fmt.Errorf("invalid audit source %q", cfg.Source)
++	}
++	if len(cfg.AllowedActions) == 0 {
++		return nil, errors.New("at least one allowed action is required")
++	}
++	allowed := make(map[string]struct{}, len(cfg.AllowedActions))
++	for action := range cfg.AllowedActions {
++		if action == "" || action != strings.TrimSpace(action) {
++			return nil, fmt.Errorf("invalid allowed action %q", action)
++		}
++		allowed[action] = struct{}{}
++	}
++
++	return &Processor{
++		writer: writer, metrics: metrics, now: now,
++		source: source, allowedActions: allowed,
++	}, nil
+ }
+ 
+ func (p *Processor) Process(ctx context.Context, event Event) error {
++	defer p.recordPanic()
++
+ 	if err := validateEvent(event); err != nil {
+ 		return err
+ 	}
++	outcome := "accepted"
++	if _, ok := p.allowedActions[event.Action]; !ok {
++		outcome = "denied"
++	}
+ 	record := AuditRecord{
+-		Actor:    event.Actor,
+-		Action:   event.Action,
+-		Resource: event.Resource,
+-		At:       p.now().UTC(),
++		Actor: event.Actor, Action: event.Action, Resource: event.Resource,
++		Outcome: outcome, Source: p.source, At: p.now().UTC(),
+ 	}
+ 	if err := p.writer.Write(ctx, record); err != nil {
++		p.metrics.Add("audit.write_errors", 1)
+ 		return fmt.Errorf("write audit record: %w", err)
+ 	}
+-	p.counter.Inc("audit.records")
++	p.metrics.Add(fmt.Sprintf("audit.records.%s.%s", p.source, outcome), 1)
++	if outcome == "denied" {
++		return fmt.Errorf("%w: %s", ErrActionDenied, event.Action)
++	}
+ 	return nil
+ }
+ 
++func (p *Processor) recordPanic() {
++	recovered := recover()
++	if recovered == nil {
++		return
++	}
++	p.metrics.Add("audit.pipeline.panics", 1)
++	panic(recovered)
++}
++
++func canonicalSource(source string) string {
++	source = strings.TrimSpace(source)
++	if source == "" {
++		return "unknown"
++	}
++	return source
++}
++
+ func validateEvent(event Event) error {
+ 	if strings.TrimSpace(event.Actor) == "" {
+ 		return fmt.Errorf("%w: actor is required", ErrInvalidEvent)
+ 	}
+ 	if strings.TrimSpace(event.Action) == "" {
+ 		return fmt.Errorf("%w: action is required", ErrInvalidEvent)
+ 	}
+ 	if strings.TrimSpace(event.Resource) == "" {
+diff --git a/pipeline_test.go b/pipeline_test.go
+index f635dbf..819ff35 100644
+--- a/pipeline_test.go
++++ b/pipeline_test.go
+@@ -3,64 +3,133 @@ package auditpipe
+ import (
+ 	"context"
+ 	"errors"
+ 	"testing"
+ 	"time"
+ )
+ 
+ type captureWriter struct {
+-	records []AuditRecord
+-	err     error
++	records   []AuditRecord
++	err       error
++	panicWith any
+ }
+ 
+ func (w *captureWriter) Write(_ context.Context, record AuditRecord) error {
++	if w.panicWith != nil {
++		panic(w.panicWith)
++	}
+ 	if w.err != nil {
+ 		return w.err
+ 	}
+ 	w.records = append(w.records, record)
+ 	return nil
+ }
+ 
+-func TestProcessorWritesRecordAndMetric(t *testing.T) {
+-	writer := &captureWriter{}
+-	counter := NewMemoryCounter()
+-	when := time.Date(2026, time.March, 4, 11, 30, 0, 0, time.FixedZone("office", 3600))
+-	processor, err := NewProcessor(writer, counter, func() time.Time { return when })
++func newTestProcessor(t *testing.T, writer Writer, metrics Metrics, source string) *Processor {
++	t.Helper()
++	when := time.Date(2026, time.March, 4, 10, 30, 0, 0, time.UTC)
++	processor, err := NewProcessor(writer, metrics, func() time.Time { return when }, Config{
++		Source: source,
++		AllowedActions: map[string]struct{}{
++			"read":  {},
++			"write": {},
++		},
++	})
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
++	return processor
++}
+ 
+-	err = processor.Process(context.Background(), Event{
++func TestProcessorWritesAcceptedRecordAndMetric(t *testing.T) {
++	writer := &captureWriter{}
++	metrics := NewMemoryMetrics()
++	processor := newTestProcessor(t, writer, metrics, "")
++
++	err := processor.Process(context.Background(), Event{
+ 		Actor: "service-a", Action: "read", Resource: "invoice/42",
+ 	})
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	if len(writer.records) != 1 {
+ 		t.Fatalf("records = %d, want 1", len(writer.records))
+ 	}
+-	if got := writer.records[0].At.Location(); got != time.UTC {
+-		t.Fatalf("location = %v, want UTC", got)
++	record := writer.records[0]
++	if record.Outcome != "accepted" || record.Source != "unknown" {
++		t.Fatalf("record outcome/source = %q/%q", record.Outcome, record.Source)
+ 	}
+-	if got := counter.Value("audit.records"); got != 1 {
+-		t.Fatalf("audit.records = %d, want 1", got)
++	if got := metrics.Value("audit.records.unknown.accepted"); got != 1 {
++		t.Fatalf("accepted records = %d, want 1", got)
+ 	}
+ }
+ 
+-func TestProcessorDoesNotCountFailedWrite(t *testing.T) {
+-	writer := &captureWriter{err: errors.New("disk full")}
+-	counter := NewMemoryCounter()
+-	processor, err := NewProcessor(writer, counter, time.Now)
+-	if err != nil {
+-		t.Fatal(err)
++func TestProcessorAuditsDeniedAction(t *testing.T) {
++	writer := &captureWriter{}
++	metrics := NewMemoryMetrics()
++	processor := newTestProcessor(t, writer, metrics, "gateway")
++
++	err := processor.Process(context.Background(), Event{
++		Actor: "service-a", Action: "delete", Resource: "invoice/42",
++	})
++	if !errors.Is(err, ErrActionDenied) {
++		t.Fatalf("error = %v, want ErrActionDenied", err)
++	}
++	if len(writer.records) != 1 {
++		t.Fatalf("records = %d, want 1", len(writer.records))
++	}
++	if got := writer.records[0].Outcome; got != "denied" {
++		t.Fatalf("outcome = %q, want denied", got)
+ 	}
++	if got := metrics.Value("audit.records.gateway.denied"); got != 1 {
++		t.Fatalf("denied records = %d, want 1", got)
++	}
++}
++
++func TestProcessorCountsFailedWriteWithoutCountingOutcome(t *testing.T) {
++	writer := &captureWriter{err: errors.New("disk full")}
++	metrics := NewMemoryMetrics()
++	processor := newTestProcessor(t, writer, metrics, "worker")
+ 
+-	err = processor.Process(context.Background(), Event{
++	err := processor.Process(context.Background(), Event{
+ 		Actor: "service-a", Action: "read", Resource: "invoice/42",
+ 	})
+ 	if err == nil {
+ 		t.Fatal("expected write error")
+ 	}
+-	if got := counter.Value("audit.records"); got != 0 {
+-		t.Fatalf("audit.records = %d, want 0", got)
++	if got := metrics.Value("audit.write_errors"); got != 1 {
++		t.Fatalf("write errors = %d, want 1", got)
++	}
++	if got := metrics.Value("audit.records.worker.accepted"); got != 0 {
++		t.Fatalf("accepted records = %d, want 0", got)
++	}
++}
++
++func TestProcessorRecordsAndRepanicsWriterPanic(t *testing.T) {
++	writer := &captureWriter{panicWith: "writer invariant"}
++	metrics := NewMemoryMetrics()
++	processor := newTestProcessor(t, writer, metrics, "worker")
++
++	defer func() {
++		if got := recover(); got != "writer invariant" {
++			t.Fatalf("panic = %v, want writer invariant", got)
++		}
++		if got := metrics.Value("audit.pipeline.panics"); got != 1 {
++			t.Fatalf("panic metric = %d, want 1", got)
++		}
++	}()
++	_ = processor.Process(context.Background(), Event{
++		Actor: "service-a", Action: "read", Resource: "invoice/42",
++	})
++}
++
++func TestNewProcessorRejectsInvalidSource(t *testing.T) {
++	_, err := NewProcessor(&captureWriter{}, NewMemoryMetrics(), time.Now, Config{
++		Source: "API Gateway!",
++		AllowedActions: map[string]struct{}{
++			"read": {},
++		},
++	})
++	if err == nil {
++		t.Fatal("expected invalid source error")
+ 	}
+ }

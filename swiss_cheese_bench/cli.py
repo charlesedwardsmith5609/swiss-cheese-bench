@@ -79,7 +79,7 @@ def _report(run_dir: Path, fixtures_dir: Path, out: Path, tier: str | None) -> i
         if chart_tier not in slices:
             raise ScoringError(f"the run has no {chart_tier!r} slice (has {sorted(slices)})")
         chart = render_chart(slices[chart_tier])
-        markdown = render_report(slices, chart_path.name)
+        markdown = render_report(slices, chart_path.name, chart_tier)
         staged: list[tuple[Path, Path]] = []
         try:
             for target, text in ((chart_path, chart), (out, markdown)):

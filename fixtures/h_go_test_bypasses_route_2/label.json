@@ -1,0 +1,9 @@
+{
+  "category": "test_bypasses_route",
+  "tier": "hard",
+  "file": "server_test.go",
+  "description": "The viewer-forbidden test calls publish with a principal it put on the context, so the RequireRole middleware on the publish route never runs.",
+  "evidence": "http.HandlerFunc(srv.publish).ServeHTTP(rr, req)",
+  "author": "grok-4.7-medium-fast",
+  "why_hard": "The viewer test still sends a bearer token and expects 403 from an httptest request, and the operator test really does use Handler, so invoking publish after planting the principal reads like a focused check of the same gate."
+}

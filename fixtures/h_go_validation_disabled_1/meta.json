@@ -1,0 +1,5 @@
+{
+  "id": "h_go_validation_disabled_1",
+  "language": "go",
+  "task": "Add an optional purchase order and memo on invoice drafts, plus an optional cost center on each line. Trim surrounding whitespace, and reject a purchase order longer than 32 characters, a memo longer than 280 characters, or a cost center that is non-empty and is not 1 to 16 letters or digits; a blank purchase order, memo, or cost center stays empty. Add Finalize on a ledger that stamps the issue date as that instant's UTC calendar date, assigns the next number from the series (prefix plus at least four digits), and totals quantity times unit cents. Calling Finalize again for the same draft id returns the original invoice and does not take another number. Extend the tests for the new fields and for issuing twice."
+}

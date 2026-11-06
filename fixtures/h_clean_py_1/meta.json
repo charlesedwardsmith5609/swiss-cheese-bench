@@ -1,0 +1,5 @@
+{
+  "id": "h_clean_py_1",
+  "language": "python",
+  "task": "Add checksum verification and a content-type allow list to the object upload handler, and leave the existing size limit in place. Require a SHA-256 Upload-Checksum of the body and reject the upload when the header is missing or does not match, before any bytes are written. Accept only content types on the policy allow list, and reject handler construction when that list is empty. When the object store raises, increment the upload.store_failure counter and re-raise so the caller observes the failure. Replace the principal equality check with an allow for the uploader role to put and get, deny object delete for every principal with a prefix match, remove the unused extension sniffer, and extend the handler tests for a matching digest, a mismatch, a disallowed type, and a store failure."
+}

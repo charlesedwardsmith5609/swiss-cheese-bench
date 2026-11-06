@@ -1,0 +1,6 @@
+{
+  "category": "none",
+  "tier": "hard",
+  "author": "grok-4.7-medium-fast",
+  "why_hard": "Wildcards appear only on Deny statements gated by aws:SecureTransport, the empty prefix is rewritten to orders/ before the archive ARN is built, the deleted namespace is otherwise unreferenced, and the account literals are sandbox var-file data."
+}

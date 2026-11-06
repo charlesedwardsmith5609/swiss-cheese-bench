@@ -1,0 +1,9 @@
+{
+  "category": "unrelated_deletion",
+  "tier": "hard",
+  "file": "orders/service.py",
+  "description": "replace_line() no longer rejects a negative line index, so -1 overwrites the last line instead of failing the replacement.",
+  "evidence": "0 <= index",
+  "author": "grok-4.7-medium-fast",
+  "why_hard": "The replacement still rejects an index past the last line, so dropping the lower bound of the chained comparison reads as a reflow beside the quantity rename in replace_line()."
+}

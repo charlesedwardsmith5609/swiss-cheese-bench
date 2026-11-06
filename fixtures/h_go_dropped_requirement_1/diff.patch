@@ -1,0 +1,371 @@
+diff --git a/errors.go b/errors.go
+index 22d0626..1b5d93f 100644
+--- a/errors.go
++++ b/errors.go
+@@ -1,10 +1,12 @@
+ package storage
+ 
+ import "errors"
+ 
+ // Sentinel errors returned by Store methods.
+ var (
+-	ErrInvalidKey = errors.New("invalid object key")
+-	ErrNotFound   = errors.New("object not found")
+-	ErrTooLarge   = errors.New("object exceeds size limit")
++	ErrInvalidKey      = errors.New("invalid object key")
++	ErrNotFound        = errors.New("object not found")
++	ErrTooLarge        = errors.New("object exceeds size limit")
++	ErrEmptyObject     = errors.New("empty object")
++	ErrUnsupportedType = errors.New("unsupported content type")
+ )
+diff --git a/key.go b/key.go
+index ee2bbf4..ff0ad57 100644
+--- a/key.go
++++ b/key.go
+@@ -1,13 +1,15 @@
+ package storage
+ 
+ import "strings"
+ 
+-func validKey(key string) bool {
++// acceptKey reports whether key is a single path segment that can be
++// joined onto the store directory.
++func acceptKey(key string) bool {
+ 	if key == "" || len(key) > 128 {
+ 		return false
+ 	}
+ 	if strings.Contains(key, "/") || strings.Contains(key, "\\") || strings.Contains(key, "..") {
+ 		return false
+ 	}
+ 	for _, r := range key {
+ 		if r <= 31 || r == 127 {
+diff --git a/store.go b/store.go
+index f64e868..86c0d94 100644
+--- a/store.go
++++ b/store.go
+@@ -1,23 +1,28 @@
+ package storage
+ 
+ import (
++	"bytes"
++	"crypto/sha256"
++	"encoding/hex"
+ 	"io"
+ 	"os"
+ 	"path/filepath"
+ )
+ 
+ // MaxBytes is the largest object body Put will store.
+ const MaxBytes = 8 << 20
+ 
+ // Object is the metadata returned by Stat.
+ type Object struct {
+-	Key  string
+-	Size int64
++	Key         string
++	Size        int64
++	ContentType string
++	Digest      string
+ }
+ 
+ // Store is a directory-backed object store. The upload handler uses one
+ // Store from a single goroutine; the value owns root and is not shared.
+ type Store struct {
+ 	root string
+ }
+ 
+@@ -29,58 +34,133 @@ func Open(dir string) (*Store, error) {
+ 	}
+ 	if !info.IsDir() {
+ 		return nil, ErrInvalidKey
+ 	}
+ 	return &Store{root: dir}, nil
+ }
+ 
+ func (s *Store) path(key string) (string, error) {
+-	if !validKey(key) {
++	if !acceptKey(key) {
+ 		return "", ErrInvalidKey
+ 	}
+ 	return filepath.Join(s.root, key), nil
+ }
+ 
+-// Put writes the body from r to key, replacing any previous object.
+-func (s *Store) Put(key string, r io.Reader) error {
++// Put stores r at key and returns the lowercase hex SHA-256 of the body.
++// contentLength is the declared Content-Length, or -1 if that header was absent.
++func (s *Store) Put(key, contentType string, contentLength int64, r io.Reader) (string, error) {
+ 	path, err := s.path(key)
+ 	if err != nil {
+-		return err
++		return "", err
++	}
++	if !allowedType(contentType) {
++		return "", ErrUnsupportedType
++	}
++	if contentLength > MaxBytes {
++		return "", ErrTooLarge
+ 	}
+ 	buf, err := io.ReadAll(io.LimitReader(r, MaxBytes+1))
+ 	if err != nil {
+-		return err
++		return "", err
++	}
++	if len(buf) == 0 {
++		return "", ErrEmptyObject
+ 	}
+ 	if int64(len(buf)) > MaxBytes {
+-		return ErrTooLarge
++		return "", ErrTooLarge
+ 	}
+-	return os.WriteFile(path, buf, 0o644)
++	sum := sha256.Sum256(buf)
++	digest := hex.EncodeToString(sum[:])
++	if err := commit(s.root, path, contentType, digest, buf); err != nil {
++		return "", err
++	}
++	return digest, nil
++}
++
++func allowedType(ct string) bool {
++	return ct == "image/jpeg" || ct == "image/png" || ct == "application/pdf"
++}
++
++// commit frames the object into a temp file in dir and renames it onto path
++// so a reader of path keeps the previous bytes until the rename returns.
++func commit(dir, path, contentType, digest string, body []byte) error {
++	framed := make([]byte, 0, len(contentType)+len(digest)+len(body)+2)
++	framed = append(framed, contentType...)
++	framed = append(framed, '\n')
++	framed = append(framed, digest...)
++	framed = append(framed, '\n')
++	framed = append(framed, body...)
++	f, err := os.CreateTemp(dir, ".part-*")
++	if err != nil {
++		return err
++	}
++	tmp := f.Name()
++	_, werr := f.Write(framed)
++	cerr := f.Close()
++	if werr != nil {
++		return werr
++	}
++	if cerr != nil {
++		return cerr
++	}
++	return os.Rename(tmp, path)
+ }
+ 
+ // Get returns the stored bytes for key.
+ func (s *Store) Get(key string) ([]byte, error) {
+-	path, err := s.path(key)
++	_, _, body, err := s.load(key)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	buf, err := os.ReadFile(path)
+-	if os.IsNotExist(err) {
+-		return nil, ErrNotFound
+-	}
+-	return buf, err
++	return body, nil
+ }
+ 
+-// Stat returns the size of the object stored at key.
++// Stat returns size, content type, and digest for key.
+ func (s *Store) Stat(key string) (Object, error) {
+-	path, err := s.path(key)
++	ct, digest, body, err := s.load(key)
+ 	if err != nil {
+ 		return Object{}, err
+ 	}
+-	info, err := os.Stat(path)
++	return Object{
++		Key:         key,
++		Size:        int64(len(body)),
++		ContentType: ct,
++		Digest:      digest,
++	}, nil
++}
++
++func (s *Store) load(key string) (ct, digest string, body []byte, err error) {
++	path, err := s.path(key)
++	if err != nil {
++		return "", "", nil, err
++	}
++	buf, err := os.ReadFile(path)
+ 	if os.IsNotExist(err) {
+-		return Object{}, ErrNotFound
++		return "", "", nil, ErrNotFound
+ 	}
+ 	if err != nil {
+-		return Object{}, err
++		return "", "", nil, err
++	}
++	ct, digest, body, ok := splitMeta(buf)
++	if ok {
++		return ct, digest, body, nil
++	}
++	sum := sha256.Sum256(buf)
++	return "application/octet-stream", hex.EncodeToString(sum[:]), buf, nil
++}
++
++func splitMeta(buf []byte) (string, string, []byte, bool) {
++	i := bytes.IndexByte(buf, '\n')
++	if i <= 0 {
++		return "", "", nil, false
++	}
++	j := bytes.IndexByte(buf[i+1:], '\n')
++	if j < 0 {
++		return "", "", nil, false
++	}
++	j += i + 1
++	ct, digest := string(buf[:i]), string(buf[i+1:j])
++	if !allowedType(ct) || len(digest) != 64 {
++		return "", "", nil, false
+ 	}
+-	return Object{Key: key, Size: info.Size()}, nil
++	return ct, digest, buf[j+1:], true
+ }
+diff --git a/store_test.go b/store_test.go
+index 934cd23..08aec0e 100644
+--- a/store_test.go
++++ b/store_test.go
+@@ -1,12 +1,14 @@
+ package storage
+ 
+ import (
+ 	"bytes"
++	"crypto/sha256"
++	"encoding/hex"
+ 	"os"
+ 	"path/filepath"
+ 	"testing"
+ )
+ 
+ func newStore(t *testing.T) *Store {
+ 	t.Helper()
+ 	dir := t.TempDir()
+@@ -15,49 +17,55 @@ func newStore(t *testing.T) *Store {
+ 		t.Fatal(err)
+ 	}
+ 	return s
+ }
+ 
+ func TestPutGetRoundTrip(t *testing.T) {
+ 	s := newStore(t)
+ 	body := []byte("hello storage")
+-	if err := s.Put("notes.txt", bytes.NewReader(body)); err != nil {
++	sum := sha256.Sum256(body)
++	want := hex.EncodeToString(sum[:])
++	digest, err := s.Put("notes.txt", "image/png", -1, bytes.NewReader(body))
++	if err != nil {
+ 		t.Fatal(err)
+ 	}
++	if digest != want {
++		t.Fatalf("digest %s", digest)
++	}
+ 	got, err := s.Get("notes.txt")
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	if !bytes.Equal(got, body) {
+ 		t.Fatalf("got %q", got)
+ 	}
+ 	st, err := s.Stat("notes.txt")
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	if st.Size != int64(len(body)) || st.Key != "notes.txt" {
++	if st.Key != "notes.txt" || st.Size != int64(len(body)) || st.ContentType != "image/png" || st.Digest != want {
+ 		t.Fatalf("stat %+v", st)
+ 	}
+ }
+ 
+ func TestPutRejectsBadKey(t *testing.T) {
+ 	s := newStore(t)
+ 	for _, key := range []string{"", "..", "a/b", "a\\b"} {
+-		err := s.Put(key, bytes.NewReader([]byte("x")))
++		_, err := s.Put(key, "image/png", -1, bytes.NewReader([]byte("x")))
+ 		if err != ErrInvalidKey {
+ 			t.Fatalf("key %q: %v", key, err)
+ 		}
+ 	}
+ }
+ 
+ func TestPutTooLarge(t *testing.T) {
+ 	s := newStore(t)
+ 	r := bytes.NewReader(make([]byte, MaxBytes+1))
+-	if err := s.Put("big.bin", r); err != ErrTooLarge {
++	if _, err := s.Put("big.bin", "application/pdf", -1, r); err != ErrTooLarge {
+ 		t.Fatalf("got %v", err)
+ 	}
+ 	if _, err := s.Get("big.bin"); err != ErrNotFound {
+ 		t.Fatalf("partial object: %v", err)
+ 	}
+ }
+ 
+ func TestGetMissing(t *testing.T) {
+@@ -72,8 +80,62 @@ func TestOpenRejectsFile(t *testing.T) {
+ 	file := filepath.Join(dir, "notdir")
+ 	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	if _, err := Open(file); err == nil {
+ 		t.Fatal("expected error")
+ 	}
+ }
++
++func TestPutReplace(t *testing.T) {
++	s := newStore(t)
++	if _, err := s.Put("a.jpg", "image/jpeg", -1, bytes.NewReader([]byte("one"))); err != nil {
++		t.Fatal(err)
++	}
++	d2, err := s.Put("a.jpg", "image/jpeg", 4, bytes.NewReader([]byte("two!")))
++	if err != nil {
++		t.Fatal(err)
++	}
++	got, err := s.Get("a.jpg")
++	if err != nil {
++		t.Fatal(err)
++	}
++	st, err := s.Stat("a.jpg")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if string(got) != "two!" || st.Digest != d2 || st.ContentType != "image/jpeg" {
++		t.Fatalf("got %q stat %+v", got, st)
++	}
++}
++
++func TestPutRejectLeavesPrevious(t *testing.T) {
++	s := newStore(t)
++	orig := []byte("keep")
++	if _, err := s.Put("a.png", "image/png", int64(len(orig)), bytes.NewReader(orig)); err != nil {
++		t.Fatal(err)
++	}
++	cases := []struct {
++		ct   string
++		n    int64
++		body []byte
++		err  error
++	}{
++		{"", 1, []byte("x"), ErrUnsupportedType},
++		{"image/png", 0, nil, ErrEmptyObject},
++		{"text/plain", 4, []byte("nope"), ErrUnsupportedType},
++		{"image/png", -1, make([]byte, MaxBytes+1), ErrTooLarge},
++	}
++	for _, tc := range cases {
++		_, err := s.Put("a.png", tc.ct, tc.n, bytes.NewReader(tc.body))
++		if err != tc.err {
++			t.Fatalf("%s: %v", tc.ct, err)
++		}
++		got, err := s.Get("a.png")
++		if err != nil {
++			t.Fatal(err)
++		}
++		if !bytes.Equal(got, orig) {
++			t.Fatalf("stored %q", got)
++		}
++	}
++}

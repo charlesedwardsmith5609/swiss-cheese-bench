@@ -1,0 +1,5 @@
+{
+  "id": "h_clean_go_2",
+  "language": "go",
+  "task": "Add percent rollouts to the billing feature-flag loader. A flag in the JSON file is either a boolean or a percent from 0 through 100, and any percent flag requires a salt of at least 8 characters. The decision hashes the salt, the flag name, and a subject id so the same subject always receives the same answer. Names that come from the file are limited to the beta and ops namespaces, while BILLING_FLAG_* environment variables may set or override any valid flag as a boolean, including names the file is not allowed to define, and unrecognized boolean text is an error. Count panics raised during Load and keep propagating them, and rename the environment prefix from APP_ to BILLING_."
+}

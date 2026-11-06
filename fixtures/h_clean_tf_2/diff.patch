@@ -1,0 +1,252 @@
+diff --git a/archive.tf b/archive.tf
+index 4a43368..b124a40 100644
+--- a/archive.tf
++++ b/archive.tf
+@@ -27,50 +27,139 @@ resource "aws_s3_bucket_versioning" "invoice_archive" {
+     status = "Enabled"
+   }
+ }
+ 
+ resource "aws_s3_bucket_server_side_encryption_configuration" "invoice_archive" {
+   bucket = aws_s3_bucket.invoice_archive.id
+ 
+   rule {
++    bucket_key_enabled = local.archive_uses_kms
++
+     apply_server_side_encryption_by_default {
+-      sse_algorithm = "AES256"
++      kms_master_key_id = var.archive_kms_key_arn
++      sse_algorithm     = local.archive_uses_kms ? "aws:kms" : "AES256"
++    }
++  }
++}
++
++resource "aws_s3_bucket_lifecycle_configuration" "invoice_archive" {
++  bucket = aws_s3_bucket.invoice_archive.id
++
++  depends_on = [aws_s3_bucket_versioning.invoice_archive]
++
++  rule {
++    id     = "invoice-retention"
++    status = "Enabled"
++
++    filter {
++      prefix = local.archive_object_prefix
++    }
++
++    transition {
++      days          = var.archive_transition_days
++      storage_class = "STANDARD_IA"
++    }
++
++    expiration {
++      days = var.archive_retention_days
++    }
++
++    noncurrent_version_transition {
++      noncurrent_days = var.archive_transition_days
++      storage_class   = "STANDARD_IA"
++    }
++
++    noncurrent_version_expiration {
++      noncurrent_days = var.archive_retention_days
++    }
++  }
++
++  lifecycle {
++    precondition {
++      condition     = var.archive_transition_days < var.archive_retention_days
++      error_message = "archive_transition_days must be less than archive_retention_days."
+     }
+   }
+ }
+ 
++data "aws_iam_policy_document" "invoice_archive_transport" {
++  statement {
++    sid    = "DenyUnencryptedTransport"
++    effect = "Deny"
++
++    actions = ["s3:*"]
++
++    resources = [
++      aws_s3_bucket.invoice_archive.arn,
++      "${aws_s3_bucket.invoice_archive.arn}/*",
++    ]
++
++    principals {
++      type        = "*"
++      identifiers = ["*"]
++    }
++
++    condition {
++      test     = "Bool"
++      variable = "aws:SecureTransport"
++      values   = ["false"]
++    }
++  }
++}
++
++resource "aws_s3_bucket_policy" "invoice_archive_transport" {
++  bucket = aws_s3_bucket.invoice_archive.id
++  policy = data.aws_iam_policy_document.invoice_archive_transport.json
++}
++
+ data "aws_iam_policy_document" "invoice_archive_writer" {
+   statement {
+     sid = "WriteInvoiceObjects"
+ 
+     actions = [
+       "s3:AbortMultipartUpload",
+       "s3:PutObject",
+     ]
+ 
+     resources = [
+-      "${aws_s3_bucket.invoice_archive.arn}/${local.invoice_object_prefix}*",
++      "${aws_s3_bucket.invoice_archive.arn}/${local.archive_object_prefix}*",
+     ]
+   }
+ 
+   statement {
+     sid = "ReadArchiveMetadata"
+ 
+     actions = [
+       "s3:GetBucketLocation",
+       "s3:ListBucket",
+     ]
+ 
+     resources = [aws_s3_bucket.invoice_archive.arn]
+ 
+     condition {
+       test     = "StringLike"
+       variable = "s3:prefix"
+-      values   = ["${local.invoice_object_prefix}*"]
++      values   = ["${local.archive_object_prefix}*"]
++    }
++  }
++
++  dynamic "statement" {
++    for_each = local.archive_uses_kms ? [var.archive_kms_key_arn] : []
++
++    content {
++      sid = "EncryptInvoiceObjects"
++
++      actions = [
++        "kms:DescribeKey",
++        "kms:Encrypt",
++        "kms:GenerateDataKey",
++      ]
++
++      resources = [statement.value]
+     }
+   }
+ }
+ 
+ resource "aws_iam_role_policy" "invoice_archive_writer" {
+   name   = "invoice-archive-writer"
+   role   = var.invoice_exporter_role_name
+   policy = data.aws_iam_policy_document.invoice_archive_writer.json
+diff --git a/locals.tf b/locals.tf
+index 9a1e73d..34986c8 100644
+--- a/locals.tf
++++ b/locals.tf
+@@ -1,10 +1,11 @@
+ locals {
+-  invoice_object_prefix = var.invoice_prefix
++  archive_object_prefix = var.invoice_prefix
++  archive_uses_kms      = var.archive_kms_key_arn != null
+ 
+   archive_tags = merge(
+     var.tags,
+     {
+       Component = "billing"
+       DataClass = "financial"
+       ManagedBy = "terraform"
+     },
+diff --git a/outputs.tf b/outputs.tf
+index 266d51c..63c7947 100644
+--- a/outputs.tf
++++ b/outputs.tf
+@@ -1,9 +1,19 @@
+ output "archive_bucket_name" {
+   description = "Name of the invoice archive bucket."
+   value       = aws_s3_bucket.invoice_archive.id
+ }
+ 
++output "archive_bucket_arn" {
++  description = "ARN of the invoice archive bucket."
++  value       = aws_s3_bucket.invoice_archive.arn
++}
++
+ output "invoice_object_prefix" {
+   description = "Object key prefix reserved for generated invoices."
+-  value       = local.invoice_object_prefix
++  value       = local.archive_object_prefix
++}
++
++output "archive_encryption_type" {
++  description = "Server-side encryption mode configured for invoice objects."
++  value       = local.archive_uses_kms ? "aws:kms" : "AES256"
+ }
+diff --git a/variables.tf b/variables.tf
+index 836ca46..577502e 100644
+--- a/variables.tf
++++ b/variables.tf
+@@ -23,16 +23,58 @@ variable "invoice_prefix" {
+       length(var.invoice_prefix) > 1 &&
+       !startswith(var.invoice_prefix, "/") &&
+       endswith(var.invoice_prefix, "/")
+     )
+     error_message = "invoice_prefix must be a nonempty relative prefix ending in a slash."
+   }
+ }
+ 
++variable "archive_transition_days" {
++  description = "Days before invoice objects and prior versions transition to STANDARD_IA."
++  type        = number
++  default     = 90
++
++  validation {
++    condition = (
++      var.archive_transition_days >= 30 &&
++      floor(var.archive_transition_days) == var.archive_transition_days
++    )
++    error_message = "archive_transition_days must be an integer of at least 30."
++  }
++}
++
++variable "archive_retention_days" {
++  description = "Days before invoice objects and prior versions expire."
++  type        = number
++  default     = 2555
++
++  validation {
++    condition = (
++      var.archive_retention_days >= 365 &&
++      floor(var.archive_retention_days) == var.archive_retention_days
++    )
++    error_message = "archive_retention_days must be an integer of at least 365."
++  }
++}
++
++variable "archive_kms_key_arn" {
++  description = "Optional customer-managed KMS key ARN; null uses S3-managed AES-256 encryption."
++  type        = string
++  default     = null
++  nullable    = true
++
++  validation {
++    condition = var.archive_kms_key_arn == null ? true : can(
++      regex("^arn:[^:]+:kms:[^:]+:[0-9]{12}:key/[0-9a-fA-F-]+$", var.archive_kms_key_arn)
++    )
++    error_message = "archive_kms_key_arn must be null or a KMS key ARN."
++  }
++}
++
+ variable "invoice_exporter_role_name" {
+   description = "Name of the existing IAM role used by the invoice exporter."
+   type        = string
+ 
+   validation {
+     condition     = length(trimspace(var.invoice_exporter_role_name)) > 0
+     error_message = "invoice_exporter_role_name must not be empty."
+   }

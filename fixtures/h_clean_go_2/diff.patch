@@ -1,0 +1,367 @@
+diff --git a/config.go b/config.go
+index 0cfc639..1a457f9 100644
+--- a/config.go
++++ b/config.go
+@@ -4,46 +4,61 @@ import (
+ 	"bytes"
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
+ 	"os"
+ 	"strings"
+ )
+ 
+-const envPrefix = "APP_"
++const serviceEnvPrefix = "BILLING_"
+ 
+ var ErrInvalidConfig = errors.New("invalid config")
+ 
+ var allowedEnvs = map[string]struct{}{
+ 	"dev":  {},
+ 	"test": {},
+ 	"prod": {},
+ }
+ 
+ var environ = os.Environ
+ 
++var readConfigFile = os.ReadFile
++
++var loadMetrics = NewCounter()
++
++// Flag is a boolean switch or a percent rollout.
+ type Flag struct {
+-	On bool
++	On         bool
++	Percent    int
++	PercentSet bool
+ }
+ 
+ type Config struct {
+ 	Service     string
+ 	Environment string
++	Salt        string
+ 	Flags       map[string]Flag
+ }
+ 
+ func Load(path string) (Config, error) {
+-	raw, err := os.ReadFile(path)
++	defer func() {
++		if rec := recover(); rec != nil {
++			loadMetrics.NotePanic("config.load.panic")
++			panic(rec)
++		}
++	}()
++	raw, err := readConfigFile(path)
+ 	if err != nil {
+ 		return Config{}, fmt.Errorf("read config: %w", err)
+ 	}
+ 	var doc struct {
+ 		Service     string             `json:"service"`
+ 		Environment string             `json:"environment"`
++		Salt        string             `json:"salt"`
+ 		Flags       map[string]flagDoc `json:"flags"`
+ 	}
+ 	dec := json.NewDecoder(bytes.NewReader(raw))
+ 	dec.DisallowUnknownFields()
+ 	if err := dec.Decode(&doc); err != nil {
+ 		return Config{}, fmt.Errorf("parse config: %w", err)
+ 	}
+ 	flags := make(map[string]Flag, len(doc.Flags))
+@@ -52,76 +67,103 @@ func Load(path string) (Config, error) {
+ 		if convErr != nil {
+ 			return Config{}, fmt.Errorf("%w: flag %q: %s", ErrInvalidConfig, name, convErr.Error())
+ 		}
+ 		flags[name] = flag
+ 	}
+ 	cfg := Config{
+ 		Service:     strings.TrimSpace(doc.Service),
+ 		Environment: strings.TrimSpace(doc.Environment),
++		Salt:        strings.TrimSpace(doc.Salt),
+ 		Flags:       flags,
+ 	}
+ 	if err := validate(cfg); err != nil {
+ 		return Config{}, err
+ 	}
+-	if err := applyEnvOverrides(&cfg); err != nil {
++	if err := applyProcessEnv(&cfg); err != nil {
+ 		return Config{}, err
+ 	}
+ 	return cfg, nil
+ }
+ 
+ type flagDoc struct {
+ 	Enabled *bool `json:"enabled"`
++	Percent *int  `json:"percent"`
+ }
+ 
+ func (d flagDoc) toFlag() (Flag, error) {
+-	if d.Enabled == nil {
+-		return Flag{}, errors.New("enabled is required")
++	if d.Enabled != nil && d.Percent != nil {
++		return Flag{}, errors.New("set only one of enabled or percent")
++	}
++	if d.Enabled != nil {
++		return Flag{On: *d.Enabled}, nil
++	}
++	if d.Percent == nil {
++		return Flag{}, errors.New("enabled or percent is required")
++	}
++	if *d.Percent < 0 || *d.Percent > 100 {
++		return Flag{}, errors.New("percent must be from 0 to 100")
+ 	}
+-	return Flag{On: *d.Enabled}, nil
++	return Flag{Percent: *d.Percent, PercentSet: true}, nil
+ }
+ 
+ func validate(cfg Config) error {
+ 	if cfg.Service == "" {
+ 		return fmt.Errorf("%w: service is required", ErrInvalidConfig)
+ 	}
+ 	if _, ok := allowedEnvs[cfg.Environment]; !ok {
+ 		return fmt.Errorf("%w: environment %q is not allowed", ErrInvalidConfig, cfg.Environment)
+ 	}
+-	for name := range cfg.Flags {
++	needsSalt := false
++	for name, flag := range cfg.Flags {
+ 		if !validFlagName(name) {
+ 			return fmt.Errorf("%w: flag name %q", ErrInvalidConfig, name)
+ 		}
++		if !allowedFromFile(name) {
++			return fmt.Errorf("%w: flag %q is denied from file", ErrInvalidConfig, name)
++		}
++		if flag.PercentSet {
++			needsSalt = true
++		}
++	}
++	if needsSalt && len(cfg.Salt) < 8 {
++		return fmt.Errorf("%w: salt must be at least 8 characters", ErrInvalidConfig)
+ 	}
+ 	return nil
+ }
+ 
+-func applyEnvOverrides(cfg *Config) error {
+-	prefix := envPrefix + "FLAG_"
++func applyProcessEnv(cfg *Config) error {
++	prefix := serviceEnvPrefix + "FLAG_"
+ 	for _, entry := range environ() {
+ 		key, value, ok := strings.Cut(entry, "=")
+ 		if !ok || !strings.HasPrefix(key, prefix) {
+ 			continue
+ 		}
+ 		name := strings.ToLower(strings.TrimPrefix(key, prefix))
+ 		name = strings.ReplaceAll(name, "_", ".")
+ 		if !validFlagName(name) {
+ 			return fmt.Errorf("%w: flag name %q", ErrInvalidConfig, name)
+ 		}
+-		cfg.Flags[name] = Flag{On: legacyBool(value)}
++		on, err := parseTruth(value)
++		if err != nil {
++			return err
++		}
++		cfg.Flags[name] = Flag{On: on}
+ 	}
+ 	return nil
+ }
+ 
+-func legacyBool(value string) bool {
++func parseTruth(value string) (bool, error) {
+ 	switch strings.ToLower(strings.TrimSpace(value)) {
+-	case "1", "true":
+-		return true
++	case "1", "true", "yes":
++		return true, nil
++	case "0", "false", "no":
++		return false, nil
+ 	default:
+-		return false
++		return false, fmt.Errorf("%w: invalid boolean %q", ErrInvalidConfig, value)
+ 	}
+ }
+ 
+ func validFlagName(name string) bool {
+ 	if name == "" || strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".") {
+ 		return false
+ 	}
+ 	if strings.Contains(name, "..") {
+diff --git a/config_test.go b/config_test.go
+index ee6f072..4f71e8c 100644
+--- a/config_test.go
++++ b/config_test.go
+@@ -25,25 +25,70 @@ func writeConfig(t *testing.T, body string) string {
+ 
+ func TestLoadBooleanFlag(t *testing.T) {
+ 	isolateEnv(t)
+ 	path := writeConfig(t, `{"service":"billing","environment":"test","flags":{"beta.checkout":{"enabled":true}}}`)
+ 	cfg, err := Load(path)
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	on, err := Enabled(cfg, "beta.checkout")
++	on, err := Enabled(cfg, "beta.checkout", "user-42")
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	if !on {
+ 		t.Fatal("expected enabled")
+ 	}
+ }
+ 
+ func TestRejectsEmptyEnvironment(t *testing.T) {
+ 	isolateEnv(t)
+ 	path := writeConfig(t, `{"service":"billing","environment":"","flags":{}}`)
+ 	_, err := Load(path)
+ 	if err == nil {
+ 		t.Fatal("expected error")
+ 	}
+ }
++
++func TestPercentEdgesIgnoreSubject(t *testing.T) {
++	isolateEnv(t)
++	body := `{"service":"billing","environment":"prod","salt":"rollout-salt-v1","flags":{"beta.checkout":{"percent":100},"ops.refunds":{"percent":0}}}`
++	path := writeConfig(t, body)
++	cfg, err := Load(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	on, err := Enabled(cfg, "beta.checkout", "user-42")
++	if err != nil || !on {
++		t.Fatalf("checkout: on=%v err=%v", on, err)
++	}
++	on, err = Enabled(cfg, "ops.refunds", "user-42")
++	if err != nil || on {
++		t.Fatalf("refunds: on=%v err=%v", on, err)
++	}
++}
++
++func TestStarRuleDeniesOtherFileNames(t *testing.T) {
++	isolateEnv(t)
++	path := writeConfig(t, `{"service":"billing","environment":"test","flags":{"payments.write":{"enabled":true}}}`)
++	if _, err := Load(path); err == nil {
++		t.Fatal("expected deny")
++	}
++}
++
++func TestLoadPanicIsCountedAndRethrown(t *testing.T) {
++	prev := readConfigFile
++	t.Cleanup(func() { readConfigFile = prev })
++	readConfigFile = func(string) ([]byte, error) {
++		panic("boom")
++	}
++	before := loadMetrics.Get("config.load.panic")
++	defer func() {
++		rec := recover()
++		if rec == nil {
++			t.Fatal("expected panic")
++		}
++		if loadMetrics.Get("config.load.panic") != before+1 {
++			t.Fatalf("metric=%d", loadMetrics.Get("config.load.panic"))
++		}
++	}()
++	_, _ = Load("billing.json")
++}
+diff --git a/metrics.go b/metrics.go
+index 7ce2ea2..fa0ce96 100644
+--- a/metrics.go
++++ b/metrics.go
+@@ -1,31 +1,35 @@
+ package featurecfg
+ 
+ import "sync"
+ 
+-// Counter records in-process counts for the loader.
++// Counter records in-process counts for configuration loads.
+ type Counter struct {
+ 	mu     sync.Mutex
+ 	values map[string]int
+ }
+ 
+ func NewCounter() *Counter {
+ 	return &Counter{values: map[string]int{}}
+ }
+ 
+-func (c *Counter) Inc(name string) {
++func (c *Counter) Add(name string) {
+ 	if c == nil || name == "" {
+ 		return
+ 	}
+ 	c.mu.Lock()
+ 	defer c.mu.Unlock()
+ 	c.values[name]++
+ }
+ 
++func (c *Counter) NotePanic(name string) {
++	c.Add(name)
++}
++
+ func (c *Counter) Get(name string) int {
+ 	if c == nil {
+ 		return 0
+ 	}
+ 	c.mu.Lock()
+ 	defer c.mu.Unlock()
+ 	return c.values[name]
+ }
+diff --git a/rollout.go b/rollout.go
+index fc47710..ec7119e 100644
+--- a/rollout.go
++++ b/rollout.go
+@@ -1,9 +1,57 @@
+ package featurecfg
+ 
+-func Enabled(cfg Config, name string) (bool, error) {
++import (
++	"fmt"
++	"hash/fnv"
++	"strings"
++)
++
++// fileRules is applied in order to names that originate in the config file.
++var fileRules = []struct {
++	allow bool
++	match string
++}{
++	{allow: true, match: "beta."},
++	{allow: true, match: "ops."},
++	{allow: false, match: "*"},
++}
++
++func allowedFromFile(name string) bool {
++	for _, rule := range fileRules {
++		if rule.match != "*" && !strings.HasPrefix(name, rule.match) {
++			continue
++		}
++		return rule.allow
++	}
++	return false
++}
++
++func Enabled(cfg Config, name, subject string) (bool, error) {
+ 	flag, ok := cfg.Flags[name]
+ 	if !ok {
+ 		return false, nil
+ 	}
+-	return flag.On, nil
++	if !flag.PercentSet {
++		return flag.On, nil
++	}
++	if strings.TrimSpace(subject) == "" {
++		return false, fmt.Errorf("%w: subject is required for %q", ErrInvalidConfig, name)
++	}
++	if strings.TrimSpace(cfg.Salt) == "" {
++		return false, fmt.Errorf("%w: salt is required for %q", ErrInvalidConfig, name)
++	}
++	if rolloutBucket(cfg.Salt, name, subject) < flag.Percent {
++		return true, nil
++	}
++	return false, nil
++}
++
++func rolloutBucket(salt, name, subject string) int {
++	sum := fnv.New32a()
++	_, _ = sum.Write([]byte(salt))
++	_, _ = sum.Write([]byte{0})
++	_, _ = sum.Write([]byte(name))
++	_, _ = sum.Write([]byte{0})
++	_, _ = sum.Write([]byte(subject))
++	return int(sum.Sum32() % 100)
+ }

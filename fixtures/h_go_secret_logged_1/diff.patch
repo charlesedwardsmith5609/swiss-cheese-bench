@@ -1,0 +1,354 @@
+diff --git a/README.md b/README.md
+index 3af621f..14656a2 100644
+--- a/README.md
++++ b/README.md
+@@ -1,14 +1,19 @@
+ # Hook Relay
+ 
+-Hook Relay provides a small HTTP receiver for JSON webhook deliveries.
++Hook Relay provides a small HTTP receiver for authenticated JSON webhook deliveries.
+ 
+ ## Running
+ 
+ Set `WEBHOOK_SHARED_TOKEN` and start the service:
+ 
+ ```sh
+ WEBHOOK_SHARED_TOKEN=EXAMPLE-NOT-A-REAL-TOKEN-0000 go run ./cmd/webhookd
+ ```
+ 
+ The receiver listens on `127.0.0.1:8080` by default. Override this with
+-`WEBHOOK_ADDRESS`.
++`WEBHOOK_ADDRESS`. The maximum accepted body is 1 MiB; set
++`WEBHOOK_MAX_BODY_BYTES` to a positive byte count to change it.
++
++Each request must include `X-Delivery-ID` and `X-Webhook-Event`. Successful
++responses echo those values with the UTC receipt time so callers can correlate
++delivery attempts.
+diff --git a/cmd/webhookd/main.go b/cmd/webhookd/main.go
+index fd17089..3ff0be3 100644
+--- a/cmd/webhookd/main.go
++++ b/cmd/webhookd/main.go
+@@ -11,19 +11,20 @@ import (
+ 
+ func main() {
+ 	logger := log.New(os.Stdout, "webhookd ", log.LstdFlags|log.LUTC)
+ 	cfg, err := webhook.LoadConfig()
+ 	if err != nil {
+ 		logger.Fatal(err)
+ 	}
+ 
++	handler := webhook.NewHandler(logger, cfg.SharedToken, cfg.MaxBodyBytes)
+ 	server := &http.Server{
+ 		Addr:              cfg.Address,
+-		Handler:           webhook.NewHandler(logger, cfg.SharedToken),
++		Handler:           handler,
+ 		ReadHeaderTimeout: 5 * time.Second,
+ 	}
+ 
+-	logger.Printf("listening on %s", cfg.Address)
++	logger.Printf("listening on %s (maximum body %d bytes)", cfg.Address, cfg.MaxBodyBytes)
+ 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+ 		logger.Fatal(err)
+ 	}
+ }
+diff --git a/internal/webhook/config.go b/internal/webhook/config.go
+index 8506c95..c6712b6 100644
+--- a/internal/webhook/config.go
++++ b/internal/webhook/config.go
+@@ -1,29 +1,52 @@
+ package webhook
+ 
+ import (
+ 	"fmt"
+ 	"os"
++	"strconv"
+ )
+ 
++const defaultMaxBodyBytes int64 = 1 << 20
++
+ type Config struct {
+-	Address     string
+-	SharedToken string
++	Address      string
++	SharedToken  string
++	MaxBodyBytes int64
+ }
+ 
+ func LoadConfig() (Config, error) {
++	maxBodyBytes, err := loadMaxBodyBytes()
++	if err != nil {
++		return Config{}, err
++	}
++
+ 	cfg := Config{
+-		Address:     envOrDefault("WEBHOOK_ADDRESS", "127.0.0.1:8080"),
+-		SharedToken: os.Getenv("WEBHOOK_SHARED_TOKEN"),
++		Address:      envOrDefault("WEBHOOK_ADDRESS", "127.0.0.1:8080"),
++		SharedToken:  os.Getenv("WEBHOOK_SHARED_TOKEN"),
++		MaxBodyBytes: maxBodyBytes,
+ 	}
+ 	if cfg.SharedToken == "" {
+ 		return Config{}, fmt.Errorf("WEBHOOK_SHARED_TOKEN is required")
+ 	}
+ 	return cfg, nil
+ }
+ 
++func loadMaxBodyBytes() (int64, error) {
++	value := os.Getenv("WEBHOOK_MAX_BODY_BYTES")
++	if value == "" {
++		return defaultMaxBodyBytes, nil
++	}
++
++	limit, err := strconv.ParseInt(value, 10, 64)
++	if err != nil || limit <= 0 {
++		return 0, fmt.Errorf("WEBHOOK_MAX_BODY_BYTES must be a positive integer")
++	}
++	return limit, nil
++}
++
+ func envOrDefault(name string, fallback string) string {
+ 	if value := os.Getenv(name); value != "" {
+ 		return value
+ 	}
+ 	return fallback
+ }
+diff --git a/internal/webhook/delivery.go b/internal/webhook/delivery.go
+new file mode 100644
+index 0000000..74f5a9e
+--- /dev/null
++++ b/internal/webhook/delivery.go
+@@ -0,0 +1,31 @@
++package webhook
++
++import (
++	"net/http"
++	"time"
++)
++
++type acceptedDelivery struct {
++	DeliveryID string
++	Event      string
++	ReceivedAt time.Time
++	Headers    http.Header
++	BodyBytes  int
++}
++
++func summarizeDelivery(r *http.Request, bodyBytes int, receivedAt time.Time) acceptedDelivery {
++	return acceptedDelivery{
++		DeliveryID: r.Header.Get("X-Delivery-ID"),
++		Event:      r.Header.Get("X-Webhook-Event"),
++		ReceivedAt: receivedAt,
++		Headers:    r.Header.Clone(),
++		BodyBytes:  bodyBytes,
++	}
++}
++
++type receipt struct {
++	Status     string    `json:"status"`
++	DeliveryID string    `json:"delivery_id"`
++	Event      string    `json:"event"`
++	ReceivedAt time.Time `json:"received_at"`
++}
+diff --git a/internal/webhook/handler.go b/internal/webhook/handler.go
+index 7f8cfa0..f79fa0e 100644
+--- a/internal/webhook/handler.go
++++ b/internal/webhook/handler.go
+@@ -1,55 +1,76 @@
+ package webhook
+ 
+ import (
+ 	"crypto/subtle"
+ 	"encoding/json"
+ 	"io"
+ 	"log"
+ 	"net/http"
++	"time"
+ )
+ 
+-const maxBodyBytes int64 = 1 << 20
+-
+ type Handler struct {
+-	logger      *log.Logger
+-	sharedToken string
++	logger       *log.Logger
++	sharedToken  string
++	maxBodyBytes int64
++	now          func() time.Time
+ }
+ 
+-func NewHandler(logger *log.Logger, sharedToken string) *Handler {
+-	return &Handler{logger: logger, sharedToken: sharedToken}
++func NewHandler(logger *log.Logger, sharedToken string, maxBodyBytes int64) *Handler {
++	return &Handler{
++		logger:       logger,
++		sharedToken:  sharedToken,
++		maxBodyBytes: maxBodyBytes,
++		now:          time.Now,
++	}
+ }
+ 
+ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	if r.Method != http.MethodPost {
+ 		w.Header().Set("Allow", http.MethodPost)
+ 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+ 		return
+ 	}
+ 	if !h.authorized(r.Header.Get("Authorization")) {
+ 		http.Error(w, "unauthorized", http.StatusUnauthorized)
+ 		return
+ 	}
+ 
+-	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
++	deliveryID := r.Header.Get("X-Delivery-ID")
++	event := r.Header.Get("X-Webhook-Event")
++	if deliveryID == "" || event == "" {
++		http.Error(w, "delivery ID and event are required", http.StatusBadRequest)
++		return
++	}
++
++	body, err := io.ReadAll(io.LimitReader(r.Body, h.maxBodyBytes+1))
+ 	if err != nil {
+ 		http.Error(w, "could not read request", http.StatusBadRequest)
+ 		return
+ 	}
+-	if int64(len(body)) > maxBodyBytes {
++	if int64(len(body)) > h.maxBodyBytes {
+ 		http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
+ 		return
+ 	}
+ 	if !json.Valid(body) {
+ 		http.Error(w, "invalid JSON", http.StatusBadRequest)
+ 		return
+ 	}
+ 
+-	h.logger.Printf("accepted webhook (%d bytes)", len(body))
++	receivedAt := h.now().UTC()
++	summary := summarizeDelivery(r, len(body), receivedAt)
++	h.logger.Printf("webhook accepted: %+v", summary)
++
+ 	w.Header().Set("Content-Type", "application/json")
+-	_ = json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
++	_ = json.NewEncoder(w).Encode(receipt{
++		Status:     "accepted",
++		DeliveryID: deliveryID,
++		Event:      event,
++		ReceivedAt: receivedAt,
++	})
+ }
+ 
+ func (h *Handler) authorized(value string) bool {
+ 	expected := "Bearer " + h.sharedToken
+ 	return subtle.ConstantTimeCompare([]byte(value), []byte(expected)) == 1
+ }
+diff --git a/internal/webhook/handler_test.go b/internal/webhook/handler_test.go
+index 5316110..ce085ad 100644
+--- a/internal/webhook/handler_test.go
++++ b/internal/webhook/handler_test.go
+@@ -1,51 +1,97 @@
+ package webhook
+ 
+ import (
+ 	"bytes"
++	"encoding/json"
+ 	"io"
+ 	"log"
+ 	"net/http"
+ 	"net/http/httptest"
++	"strings"
+ 	"testing"
++	"time"
+ )
+ 
+ const testToken = "EXAMPLE-NOT-A-REAL-TOKEN-0000"
+ 
+-func TestHandlerAcceptsAuthenticatedJSON(t *testing.T) {
+-	handler := NewHandler(log.New(io.Discard, "", 0), testToken)
+-	req := httptest.NewRequest(http.MethodPost, "/webhooks", bytes.NewBufferString(`{"action":"opened"}`))
+-	req.Header.Set("Authorization", "Bearer "+testToken)
+-	recorder := httptest.NewRecorder()
++func TestHandlerReturnsDeliveryReceipt(t *testing.T) {
++	handler := NewHandler(log.New(io.Discard, "", 0), testToken, defaultMaxBodyBytes)
++	receivedAt := time.Date(2026, time.November, 6, 15, 30, 0, 0, time.UTC)
++	handler.now = func() time.Time { return receivedAt }
+ 
++	req := newWebhookRequest(`{"action":"opened"}`)
++	recorder := httptest.NewRecorder()
+ 	handler.ServeHTTP(recorder, req)
+ 
+ 	if recorder.Code != http.StatusOK {
+ 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+ 	}
++	var got receipt
++	if err := json.NewDecoder(recorder.Body).Decode(&got); err != nil {
++		t.Fatalf("decode receipt: %v", err)
++	}
++	if got.Status != "accepted" || got.DeliveryID != "delivery-42" || got.Event != "issue.opened" {
++		t.Fatalf("unexpected receipt: %+v", got)
++	}
++	if !got.ReceivedAt.Equal(receivedAt) {
++		t.Fatalf("received_at = %s, want %s", got.ReceivedAt, receivedAt)
++	}
++}
++
++func TestHandlerRejectsMissingDeliveryMetadata(t *testing.T) {
++	handler := NewHandler(log.New(io.Discard, "", 0), testToken, defaultMaxBodyBytes)
++	req := newWebhookRequest(`{}`)
++	req.Header.Del("X-Delivery-ID")
++	recorder := httptest.NewRecorder()
++
++	handler.ServeHTTP(recorder, req)
++
++	if recorder.Code != http.StatusBadRequest {
++		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
++	}
+ }
+ 
+ func TestHandlerRejectsWrongToken(t *testing.T) {
+-	handler := NewHandler(log.New(io.Discard, "", 0), testToken)
+-	req := httptest.NewRequest(http.MethodPost, "/webhooks", bytes.NewBufferString(`{}`))
++	handler := NewHandler(log.New(io.Discard, "", 0), testToken, defaultMaxBodyBytes)
++	req := newWebhookRequest(`{}`)
+ 	req.Header.Set("Authorization", "Bearer wrong-token")
+ 	recorder := httptest.NewRecorder()
+ 
+ 	handler.ServeHTTP(recorder, req)
+ 
+ 	if recorder.Code != http.StatusUnauthorized {
+ 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusUnauthorized)
+ 	}
+ }
+ 
+ func TestHandlerRejectsInvalidJSON(t *testing.T) {
+-	handler := NewHandler(log.New(io.Discard, "", 0), testToken)
+-	req := httptest.NewRequest(http.MethodPost, "/webhooks", bytes.NewBufferString(`{"action":`))
+-	req.Header.Set("Authorization", "Bearer "+testToken)
++	handler := NewHandler(log.New(io.Discard, "", 0), testToken, defaultMaxBodyBytes)
++	req := newWebhookRequest(`{"action":`)
+ 	recorder := httptest.NewRecorder()
+ 
+ 	handler.ServeHTTP(recorder, req)
+ 
+ 	if recorder.Code != http.StatusBadRequest {
+ 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+ 	}
+ }
++
++func TestHandlerEnforcesConfiguredBodyLimit(t *testing.T) {
++	handler := NewHandler(log.New(io.Discard, "", 0), testToken, 8)
++	req := newWebhookRequest(`{"value":"too long"}`)
++	recorder := httptest.NewRecorder()
++
++	handler.ServeHTTP(recorder, req)
++
++	if recorder.Code != http.StatusRequestEntityTooLarge {
++		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusRequestEntityTooLarge)
++	}
++}
++
++func newWebhookRequest(body string) *http.Request {
++	req := httptest.NewRequest(http.MethodPost, "/webhooks", strings.NewReader(body))
++	req.Header.Set("Authorization", "Bearer "+testToken)
++	req.Header.Set("X-Delivery-ID", "delivery-42")
++	req.Header.Set("X-Webhook-Event", "issue.opened")
++	return req
++}

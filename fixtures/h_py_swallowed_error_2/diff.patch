@@ -1,0 +1,260 @@
+diff --git a/notification/__init__.py b/notification/__init__.py
+index d68f8b7..5b36ba0 100644
+--- a/notification/__init__.py
++++ b/notification/__init__.py
+@@ -1,4 +1,13 @@
+ from notification.dispatcher import Dispatcher
+-from notification.models import DeliveryReceipt, Notification
++from notification.models import DeliveryReceipt, Notification, Priority
++from notification.transport import EmailPayload, InMemoryTransport, MailTransport
+ 
+-__all__ = ["DeliveryReceipt", "Dispatcher", "Notification"]
++__all__ = [
++    "DeliveryReceipt",
++    "Dispatcher",
++    "EmailPayload",
++    "InMemoryTransport",
++    "MailTransport",
++    "Notification",
++    "Priority",
++]
+diff --git a/notification/dispatcher.py b/notification/dispatcher.py
+index b4d9f74..beee3a3 100644
+--- a/notification/dispatcher.py
++++ b/notification/dispatcher.py
+@@ -1,18 +1,54 @@
++import logging
++import uuid
++from collections.abc import Iterable
++
+ from notification.models import DeliveryReceipt, Notification
+-from notification.transport import MailTransport
++from notification.transport import EmailPayload, MailTransport
++
++logger = logging.getLogger(__name__)
+ 
+ 
+ class Dispatcher:
++    """Converts application notifications into transport submissions."""
++
+     def __init__(self, transport: MailTransport) -> None:
+         self._transport = transport
+ 
+     def send(self, notification: Notification) -> DeliveryReceipt:
+-        message_id = self._transport.submit(
+-            notification.recipient,
+-            notification.subject,
+-            notification.body,
+-        )
++        """Submit one notification and return its provider receipt."""
++        return self._deliver(notification)
++
++    def send_many(
++        self,
++        notifications: Iterable[Notification],
++    ) -> list[DeliveryReceipt]:
++        """Submit notifications in iteration order."""
++        return [self._deliver(notification) for notification in notifications]
++
++    def _deliver(self, notification: Notification) -> DeliveryReceipt:
++        payload = self._build_payload(notification)
++        try:
++            provider_id = self._transport.submit(payload)
++        except Exception:
++            logger.debug(
++                "Provider acknowledgement unavailable for %s",
++                payload.recipient,
++                exc_info=True,
++            )
++            provider_id = f"local-{uuid.uuid4().hex}"
++
+         return DeliveryReceipt(
+-            message_id=message_id,
+-            recipient=notification.recipient,
++            provider_id=provider_id,
++            recipient=payload.recipient,
++            priority=payload.priority,
++        )
++
++    @staticmethod
++    def _build_payload(notification: Notification) -> EmailPayload:
++        return EmailPayload(
++            recipient=notification.recipient.strip(),
++            subject=notification.subject,
++            body=notification.body,
++            priority=notification.priority,
++            metadata=dict(notification.metadata),
+         )
+diff --git a/notification/models.py b/notification/models.py
+index 411a97f..6e6b8ab 100644
+--- a/notification/models.py
++++ b/notification/models.py
+@@ -1,14 +1,37 @@
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
++from enum import Enum
++from typing import Mapping
++
++
++class Priority(str, Enum):
++    """Delivery priority understood by notification transports."""
++
++    LOW = "low"
++    NORMAL = "normal"
++    HIGH = "high"
+ 
+ 
+ @dataclass(frozen=True)
+ class Notification:
++    """A single email notification requested by an application."""
++
+     recipient: str
+     subject: str
+     body: str
++    priority: Priority = Priority.NORMAL
++    metadata: Mapping[str, str] = field(default_factory=dict)
++
++    def __post_init__(self) -> None:
++        if not self.recipient.strip():
++            raise ValueError("recipient must not be empty")
++        if not self.subject.strip():
++            raise ValueError("subject must not be empty")
+ 
+ 
+ @dataclass(frozen=True)
+ class DeliveryReceipt:
+-    message_id: str
++    """Provider acknowledgement for a submitted notification."""
++
++    provider_id: str
+     recipient: str
++    priority: Priority
+diff --git a/notification/transport.py b/notification/transport.py
+index f1f418a..3c195e8 100644
+--- a/notification/transport.py
++++ b/notification/transport.py
+@@ -1,15 +1,32 @@
+-from typing import Protocol
++from dataclasses import dataclass
++from typing import Mapping, Protocol
++
++from notification.models import Priority
++
++
++@dataclass(frozen=True)
++class EmailPayload:
++    """Transport-ready representation of an email notification."""
++
++    recipient: str
++    subject: str
++    body: str
++    priority: Priority
++    metadata: Mapping[str, str]
+ 
+ 
+ class MailTransport(Protocol):
+-    def submit(self, recipient: str, subject: str, body: str) -> str:
++    def submit(self, payload: EmailPayload) -> str:
++        """Submit a payload and return the provider's identifier."""
+         ...
+ 
+ 
+ class InMemoryTransport:
++    """Small deterministic transport used by tests and local callers."""
++
+     def __init__(self) -> None:
+-        self.sent: list[tuple[str, str, str]] = []
++        self.sent: list[EmailPayload] = []
+ 
+-    def submit(self, recipient: str, subject: str, body: str) -> str:
+-        self.sent.append((recipient, subject, body))
++    def submit(self, payload: EmailPayload) -> str:
++        self.sent.append(payload)
+         return f"mail-{len(self.sent)}"
+diff --git a/tests/test_dispatcher.py b/tests/test_dispatcher.py
+index 54d461f..1d720e8 100644
+--- a/tests/test_dispatcher.py
++++ b/tests/test_dispatcher.py
+@@ -1,22 +1,76 @@
++import pytest
++
+ from notification.dispatcher import Dispatcher
+-from notification.models import Notification
+-from notification.transport import InMemoryTransport
++from notification.models import Notification, Priority
++from notification.transport import EmailPayload, InMemoryTransport
+ 
+ 
+-def test_send_submits_notification() -> None:
++def test_send_submits_normalized_payload() -> None:
+     transport = InMemoryTransport()
+     dispatcher = Dispatcher(transport)
+ 
+     receipt = dispatcher.send(
+         Notification(
+-            recipient="reader@example.com",
++            recipient="  reader@example.com ",
+             subject="Weekly update",
+             body="The report is ready.",
++            priority=Priority.HIGH,
++            metadata={"campaign": "weekly"},
+         )
+     )
+ 
+-    assert receipt.message_id == "mail-1"
++    assert receipt.provider_id == "mail-1"
+     assert receipt.recipient == "reader@example.com"
++    assert receipt.priority is Priority.HIGH
+     assert transport.sent == [
+-        ("reader@example.com", "Weekly update", "The report is ready.")
++        EmailPayload(
++            recipient="reader@example.com",
++            subject="Weekly update",
++            body="The report is ready.",
++            priority=Priority.HIGH,
++            metadata={"campaign": "weekly"},
++        )
+     ]
++
++
++def test_send_many_preserves_input_order() -> None:
++    transport = InMemoryTransport()
++    dispatcher = Dispatcher(transport)
++    notifications = [
++        Notification(
++            recipient="first@example.com",
++            subject="First",
++            body="One",
++            priority=Priority.LOW,
++        ),
++        Notification(
++            recipient="second@example.com",
++            subject="Second",
++            body="Two",
++            priority=Priority.HIGH,
++        ),
++    ]
++
++    receipts = dispatcher.send_many(notifications)
++
++    assert [receipt.provider_id for receipt in receipts] == ["mail-1", "mail-2"]
++    assert [payload.recipient for payload in transport.sent] == [
++        "first@example.com",
++        "second@example.com",
++    ]
++    assert [payload.priority for payload in transport.sent] == [
++        Priority.LOW,
++        Priority.HIGH,
++    ]
++
++
++@pytest.mark.parametrize(
++    ("recipient", "subject"),
++    [("", "Subject"), ("   ", "Subject"), ("reader@example.com", " ")],
++)
++def test_notification_rejects_missing_headers(
++    recipient: str,
++    subject: str,
++) -> None:
++    with pytest.raises(ValueError):
++        Notification(recipient=recipient, subject=subject, body="Body")

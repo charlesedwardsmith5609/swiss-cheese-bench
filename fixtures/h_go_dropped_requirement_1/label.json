@@ -1,0 +1,9 @@
+{
+  "category": "dropped_requirement",
+  "tier": "hard",
+  "file": "store.go",
+  "description": "A declared content length is only compared against MaxBytes, so a different positive length still replaces the stored object.",
+  "evidence": "if contentLength > MaxBytes {",
+  "author": "grok-4.7-medium-fast",
+  "why_hard": "Declared content length is already compared with MaxBytes, and every call passes either -1 or the real body size, so the missing equality check looks like finished Content-Length handling."
+}

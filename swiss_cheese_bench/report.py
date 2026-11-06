@@ -215,7 +215,9 @@ def _cohort_lines(scoring: Scoring) -> list[str]:
 TIER_TITLE = {"hard": "Hard tier", "easy": "Easy tier", "all": "All fixtures combined"}
 
 
-def render_report(scoring: Scoring | dict[str, Scoring], chart_ref: str) -> str:
+def render_report(
+    scoring: Scoring | dict[str, Scoring], chart_ref: str, chart_tier: str | None = None
+) -> str:
     """One Scoring renders as before; a dict of slices renders hard, easy, then all."""
     slices = {"": scoring} if isinstance(scoring, Scoring) else scoring
     first = next(iter(slices.values()))
@@ -248,7 +250,7 @@ def render_report(scoring: Scoring | dict[str, Scoring], chart_ref: str) -> str:
             out += ["", f"## {TIER_TITLE[tier]}", ""] + _cohort_lines(slices[tier])
             out += _slice_body(slices[tier], "###")
     chart_title = "Recall by defect category" + (
-        "" if isinstance(scoring, Scoring) else f" ({TIER_TITLE[order[0]].lower()})"
+        "" if isinstance(scoring, Scoring) else f" ({TIER_TITLE[chart_tier or order[0]].lower()})"
     )
     out += [
         "## Chart",

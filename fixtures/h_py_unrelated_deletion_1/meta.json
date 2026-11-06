@@ -1,0 +1,5 @@
+{
+  "id": "h_py_unrelated_deletion_1",
+  "language": "python",
+  "task": "Move tax and freight calculation out of the order service into a new pricing module with an explicit rate card, and use that module when submitting an order and when replacing a line. Rename LineItem.qty to quantity through the order, stock, and desk code so stored lines match the warehouse payload. Thread a requested_by actor through submit, replace_line, and cancel, and store that actor on the audit entry instead of assuming the customer id. Refresh the docstrings and order the imports to match the rest of the package."
+}
