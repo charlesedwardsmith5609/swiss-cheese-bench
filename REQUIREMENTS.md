@@ -48,3 +48,13 @@ defects, keeping the original tier for comparison.
 - Success criterion (measured, not assumed): on a live pilot, single-model recall on the hard tier
   is clearly below 100% (target roughly 40-80%) with at least some disagreement between A and B.
 - Scoring and report show easy and hard tiers separately and combined.
+
+## R6 Extra findings (added after the hard-tier pilot)
+Precision/recall against the single seeded defect cannot credit real problems a reviewer finds
+beyond it (e.g. the unintended ReceiptLog rename in h_py_validation_disabled_1), and it hides the
+way two reviewers differ in practice (the extras). Add:
+- an adjudication of every non-seeded ("extra") finding in a run as real / not_real / unclear,
+  made by a model from a third family (not A's or B's), with a human-checkable sample;
+- scoring and report sections that count validated extras per config and per model pair
+  (unique-to-A, unique-to-B, shared), and a precision variant that counts real extras as correct;
+- no change to the existing strict seeded-defect metrics.

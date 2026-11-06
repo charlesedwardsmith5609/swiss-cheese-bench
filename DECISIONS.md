@@ -130,3 +130,18 @@ Autonomous run. Each entry: what was decided, why, and how to reverse it.
     public ReceiptLog class (a real second defect in a Grok-authored fixture I had only
     label-checked: the D-30 risk materialised). The seeded loosening itself was missed by both.
   Pairing gave no benefit here; the two models' errors were perfectly correlated.
+- D-34 Step 6 (extras adjudication) plan review: all 8 findings adopted (claims with stable ids,
+  adjudicator family guard, one driver per run + per-fixture files, exact-coverage fingerprinted
+  adjudication.json, per-config cohorts, B_after_A extras, nonce-delimited untrusted text with
+  collision guard, nullable files).
+- D-35 hard-1 adjudication (grok-4.7-medium-fast, 64 claims over 20 fixtures): 56 real, 6 not_real,
+  2 unclear. Per config (distinct extras): A 16 real/1 not; B 16 real/0 not/2 unclear; A_then_B 18
+  real; A_union_B 21 real. Real extras found only by A: 5; only by B: 6; by both: 10. So the
+  second model adds real findings beyond the seeded defect (union 21 real extras vs 16 for the
+  best single) even though it added no seeded catches. Adjusted precision 92-97% vs strict 44-53%.
+  My check of a 16-item sample: agree with 13, 3 debatable (idle_at removals, an API rename); the
+  adjudicator leans lenient, one model's judgement only. Important caveats: (1) the three
+  unrelated_deletion seeded defects were found but mislabelled, and show up as "real extras";
+  (2) CLEAN controls contain issues the adjudicator calls real (e.g. h_clean_py_3 idle_at removal,
+  h_clean_tf_2 extra KMS actions, h_clean_go_1 dropped UTC assertion), so the controls are not
+  perfectly clean and strict precision overstates false positives.

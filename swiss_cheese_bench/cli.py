@@ -10,6 +10,10 @@ import tempfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
+from swiss_cheese_bench.adjudicate import (
+    DEFAULT_MODEL as DEFAULT_ADJUDICATOR,
+)
+from swiss_cheese_bench.adjudicate import AdjudicationError, adjudicate_run
 from swiss_cheese_bench.config import ConfigError, load_config
 from swiss_cheese_bench.fixtures import FixtureError, load_fixtures
 from swiss_cheese_bench.providers import Provider, ProviderError, make_provider
@@ -40,7 +44,21 @@ def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None
         default=None,
         help="slice used for the chart (default: hard if the run has it, else easy)",
     )
+    adj = sub.add_parser("adjudicate", help="judge a run's non-seeded findings via Cursor")
+    adj.add_argument("--run", type=Path, required=True)
+    adj.add_argument("--fixtures", type=Path, default=Path("fixtures"))
+    adj.add_argument("--model", default=DEFAULT_ADJUDICATOR)
+    adj.add_argument("--jobs", type=int, default=4)
+    adj.add_argument("--force", action="store_true")
     args = parser.parse_args(argv)
+    if args.command == "adjudicate":
+        try:
+            path = adjudicate_run(args.run, args.fixtures, args.model, args.jobs, args.force)
+        except AdjudicationError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(f"wrote {path}")
+        return 0
     if args.command == "report":
         return _report(args.run, args.fixtures, args.out, args.tier)
     environ = os.environ if env is None else env

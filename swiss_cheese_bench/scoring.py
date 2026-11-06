@@ -13,6 +13,7 @@ All comparative numbers use a common cohort: the fixtures for which every config
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from dataclasses import dataclass, field
@@ -87,6 +88,50 @@ class CategoryScore:
 
 
 @dataclass(frozen=True)
+class Claim:
+    """One non-seeded finding. id is `<fixture>/<kind>/<index>`; file may be None."""
+
+    id: str
+    fixture_id: str
+    kind: str
+    category: Category
+    file: str | None
+    message: str
+
+
+@dataclass(frozen=True)
+class Adjudication:
+    adjudicator: str
+    verdicts: dict[str, str]  # claim id -> real | not_real | unclear
+
+
+@dataclass(frozen=True)
+class ExtraCounts:
+    """Distinct extra findings (clusters) of one config by adjudicated verdict."""
+
+    real: int
+    not_real: int
+    unclear: int
+
+    @property
+    def total(self) -> int:
+        return self.real + self.not_real + self.unclear
+
+
+@dataclass(frozen=True)
+class ExtrasOverlap:
+    """Distinct extras raised by A and/or B on the fixtures both scored."""
+
+    fixtures: int
+    real_a_only: int
+    real_b_only: int
+    real_both: int
+    all_a_only: int
+    all_b_only: int
+    all_both: int
+
+
+@dataclass(frozen=True)
 class ConfigScore:
     name: str
     categories: dict[str, CategoryScore]  # defect categories + OVERALL
@@ -94,6 +139,7 @@ class ConfigScore:
     n_invalid_items: int
     cost_incurred_usd: float
     recall_interval: tuple[float, float] | None
+    extras: ExtraCounts | None = None  # None when the run has no adjudication
 
     @property
     def overall(self) -> CategoryScore:
@@ -102,6 +148,13 @@ class ConfigScore:
     @property
     def true_catches(self) -> int:
         return self.overall.tp
+
+    @property
+    def adjusted_precision(self) -> float | None:
+        """Precision counting adjudicated-real extras as correct (needs an adjudication)."""
+        if self.extras is None or not self.overall.predicted:
+            return None
+        return (self.overall.tp + self.extras.real) / self.overall.predicted
 
     @property
     def cost_per_true_catch(self) -> float | None:
@@ -136,6 +189,8 @@ class Scoring:
     configs: dict[str, ConfigScore] = field(default_factory=dict)
     overlap: list[OverlapRow] = field(default_factory=list)  # defect categories, then OVERALL
     marginal: list[Marginal] = field(default_factory=list)
+    adjudicator: str | None = None
+    extras_overlap: ExtrasOverlap | None = None
 
     @property
     def dry_run(self) -> bool:
@@ -342,6 +397,8 @@ def score_run(run_dir: Path, fixtures: list[Fixture], tier: str | None = None) -
     """Score one slice: the given tier, or every fixture the run covered when tier is None."""
     meta, rows = load_results(run_dir, fixtures)
     fixtures = resolve_run_fixtures(meta, fixtures)
+    run_claims = claims_from_rows(rows, fixtures)
+    adjudication = load_adjudication(run_dir, run_claims)
     if tier is not None:
         fixtures = [f for f in fixtures if f.tier == tier]
         if not fixtures:
@@ -411,6 +468,9 @@ def score_run(run_dir: Path, fixtures: list[Fixture], tier: str | None = None) -
         result.marginal.append(
             Marginal(pair, best, extra, extra_cost, extra_cost / extra if extra > 0 else None)
         )
+    if adjudication is not None:
+        scored = {c: {f.id for f in fixtures if outcomes[c][f.id].scored} for c in CONFIGS}
+        result = apply_adjudication(result, run_claims, adjudication, scored)
     return result
 
 
@@ -423,3 +483,150 @@ def score_slices(run_dir: Path, fixtures: list[Fixture]) -> dict[str, Scoring]:
     if len(tiers) > 1:
         slices["all"] = score_run(run_dir, fixtures)
     return slices
+
+
+# ------------------------------------------------------------------ extra findings (R6)
+
+VERDICTS = frozenset({"real", "not_real", "unclear"})
+
+
+def results_fingerprint(run_dir: Path) -> str:
+    try:
+        return hashlib.sha256((run_dir / "results.jsonl").read_bytes()).hexdigest()
+    except OSError as exc:
+        raise ScoringError(f"cannot read results.jsonl: {exc}") from exc
+
+
+def claims_from_rows(rows: list[CallRow], fixtures: list[Fixture]) -> list[Claim]:
+    """Every finding that is not the seeded catch, from scored calls (parse_ok), in row order."""
+    labels = {f.id: f.label for f in fixtures}
+    claims: list[Claim] = []
+    for row in rows:
+        if row.status not in SCORED_STATUSES or row.fixture_id not in labels:
+            continue
+        label = labels[row.fixture_id]
+        for index, finding in enumerate(row.findings):
+            file = normalize_path(finding.file) if finding.file else None
+            if (
+                label.category is not Category.NONE
+                and finding.category == label.category
+                and file == label.file
+            ):
+                continue
+            claims.append(
+                Claim(
+                    f"{row.fixture_id}/{row.kind}/{index}",
+                    row.fixture_id,
+                    row.kind,
+                    finding.category,
+                    file,
+                    finding.message,
+                )
+            )
+    return claims
+
+
+def load_adjudication(run_dir: Path, claims: list[Claim]) -> Adjudication | None:
+    """None when absent. A present file must match the results and cover every claim exactly."""
+    path = run_dir / "adjudication.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ScoringError(f"cannot read adjudication.json: {exc}") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("adjudicator"), str):
+        raise ScoringError("adjudication.json: adjudicator must be a string")
+    if data.get("fingerprint") != results_fingerprint(run_dir):
+        raise ScoringError("adjudication.json does not match results.jsonl (stale fingerprint)")
+    items = data.get("items")
+    if not isinstance(items, list):
+        raise ScoringError("adjudication.json: items must be a list")
+    verdicts: dict[str, str] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            raise ScoringError("adjudication.json: each item must be an object")
+        claim_id, verdict = item.get("claim_id"), item.get("verdict")
+        if not isinstance(claim_id, str) or verdict not in VERDICTS:
+            raise ScoringError("adjudication.json: bad claim_id or verdict")
+        if claim_id in verdicts:
+            raise ScoringError(f"adjudication.json: duplicate claim {claim_id!r}")
+        verdicts[claim_id] = str(verdict)
+    expected = {c.id for c in claims}
+    if set(verdicts) != expected:
+        missing, extra = len(expected - set(verdicts)), len(set(verdicts) - expected)
+        raise ScoringError(
+            f"adjudication.json does not cover the run's claims exactly "
+            f"({missing} missing, {extra} unknown)"
+        )
+    return Adjudication(data["adjudicator"], verdicts)
+
+
+def _cluster_verdict(verdicts: list[str]) -> str:
+    if all(v == "real" for v in verdicts):
+        return "real"
+    if all(v == "not_real" for v in verdicts):
+        return "not_real"
+    return "unclear"
+
+
+def _clusters(
+    claims: list[Claim], adj: Adjudication, kinds: tuple[str, ...], fixture_ids: set[str]
+) -> dict[tuple[str, Category, str | None], str]:
+    grouped: dict[tuple[str, Category, str | None], list[str]] = {}
+    for claim in claims:
+        if claim.kind in kinds and claim.fixture_id in fixture_ids:
+            key = (claim.fixture_id, claim.category, claim.file)
+            grouped.setdefault(key, []).append(adj.verdicts[claim.id])
+    return {key: _cluster_verdict(v) for key, v in grouped.items()}
+
+
+def apply_adjudication(
+    result: Scoring, claims: list[Claim], adj: Adjudication, scored_by_config: dict[str, set[str]]
+) -> Scoring:
+    """Attach per-config extra counts and the A-vs-B extras overlap to a scored slice."""
+    from dataclasses import replace
+
+    new_configs: dict[str, ConfigScore] = {}
+    for name, cfg in result.configs.items():
+        clusters = _clusters(claims, adj, SOURCES[name], scored_by_config[name])
+        counts = [v for v in clusters.values()]
+        new_configs[name] = replace(
+            cfg,
+            extras=ExtraCounts(
+                counts.count("real"), counts.count("not_real"), counts.count("unclear")
+            ),
+        )
+    both_scored = scored_by_config["A"] & scored_by_config["B"]
+    a_clusters = _clusters(claims, adj, ("A",), both_scored)
+    b_clusters = _clusters(claims, adj, ("B",), both_scored)
+    merged: dict[tuple[str, Category, str | None], tuple[bool, bool, str]] = {}
+    for key in set(a_clusters) | set(b_clusters):
+        in_a, in_b = key in a_clusters, key in b_clusters
+        verdict = _cluster_verdict([v for v in (a_clusters.get(key), b_clusters.get(key)) if v])
+        merged[key] = (in_a, in_b, verdict)
+
+    def count(only: str, real_only: bool) -> int:
+        return sum(
+            1
+            for in_a, in_b, verdict in merged.values()
+            if (not real_only or verdict == "real")
+            and (
+                (only == "a" and in_a and not in_b)
+                or (only == "b" and in_b and not in_a)
+                or (only == "both" and in_a and in_b)
+            )
+        )
+
+    result.configs = new_configs
+    result.adjudicator = adj.adjudicator
+    result.extras_overlap = ExtrasOverlap(
+        len(both_scored),
+        count("a", True),
+        count("b", True),
+        count("both", True),
+        count("a", False),
+        count("b", False),
+        count("both", False),
+    )
+    return result

@@ -145,6 +145,44 @@ def _summary_rows(scoring: Scoring) -> list[str]:
     return lines
 
 
+def _extras_section(scoring: Scoring, h: str) -> list[str]:
+    if scoring.configs["A"].extras is None:
+        return [
+            h + " Extra findings (not the seeded defect)",
+            "",
+            "Not adjudicated for this run (run `adjudicate` to judge the extra findings).",
+            "",
+        ]
+    out = [
+        h + " Extra findings (not the seeded defect)",
+        "",
+        f"Each distinct extra finding was judged by `{md_cell(scoring.adjudicator)}` (one model; "
+        "check the sample in adjudication_sample.md). Counts are distinct (fixture, category, "
+        'file) extras per config; "adjusted precision" counts real extras as correct.',
+        "",
+        "| config | real | not real | unclear | precision | adjusted precision |",
+        "|---|---|---|---|---|---|",
+    ]
+    for name in CONFIGS:
+        cfg = scoring.configs[name]
+        ex = cfg.extras
+        assert ex is not None  # noqa: S101 - all configs are set together
+        out.append(
+            f"| {CONFIG_LABEL[name]} | {ex.real} | {ex.not_real} | {ex.unclear} "
+            f"| {pct(cfg.overall.precision)} | {pct(cfg.adjusted_precision)} |"
+        )
+    ov = scoring.extras_overlap
+    if ov is not None:
+        out += [
+            "",
+            f"Over the {ov.fixtures} fixtures both A and B were scored on: real extras found only "
+            f"by A: {ov.real_a_only}; only by B: {ov.real_b_only}; by both: {ov.real_both} "
+            f"(all extras, real or not: A only {ov.all_a_only}, B only {ov.all_b_only}, "
+            f"both {ov.all_both}).",
+        ]
+    return out + [""]
+
+
 def _slice_body(scoring: Scoring, h: str) -> list[str]:
     out: list[str] = []
     out += ["", h + " Summary by reviewer config", ""] + _summary_rows(scoring) + [""]
@@ -199,7 +237,7 @@ def _slice_body(scoring: Scoring, h: str) -> list[str]:
         + (", ".join(f"`{s}`" for s in spots) if spots else "none"),
         "",
     ]
-    return out
+    return out + _extras_section(scoring, h)
 
 
 def _cohort_lines(scoring: Scoring) -> list[str]:
