@@ -78,3 +78,12 @@ Autonomous run. Each entry: what was decided, why, and how to reverse it.
 - D-25 Remote created later at the user's request: https://github.com/charlesedwardsmith5609/swiss-cheese-bench
   (created private, pushed `main`, then made public at the user's request). This supersedes the
   earlier "no remote / push impossible" notes in D-03 and D-24.
+- D-26 Step 5 (hard fixtures): at the user's request fixtures are authored through the Cursor CLI
+  (read-only ask mode) with grok-4.7-xhigh and gpt-5.6-sol-xhigh, split by category, excluding
+  Claude models (model A's family). Plan review findings (6) incorporated as assessed. Awaiting
+  user approval before any code or paid call.
+- D-27 Step 5 approved by the user with all seven second-review changes: acceptance band 40-90%
+  single-model hard-tier recall for BOTH models plus an A/B disagreement; Grok (not OpenAI) audits
+  OpenAI-authored fixtures, Grok-authored ones audited by me/user, pilot labelled in-sample;
+  `verify=False` dropped from validation_disabled; per-slice cost attribution; transactional
+  materialization; 1 MiB reply cap; test assertion allows .reviews/authoring/.

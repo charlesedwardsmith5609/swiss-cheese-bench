@@ -159,6 +159,7 @@ def run_bench(
     providers: Mapping[str, Provider],
     out_dir: Path,
     dry_run: bool,
+    tier: str = "easy",
 ) -> RunSummary:
     out_dir.mkdir(parents=True, exist_ok=True)
     tracker = CostTracker(config.cap_usd)
@@ -166,6 +167,8 @@ def run_bench(
     counts: Counter[str] = Counter()
     meta = {
         "dry_run": dry_run,
+        "tier": tier,
+        "manifest": sorted(f.id for f in fixtures),
         "cap_usd": config.cap_usd,
         "max_output_tokens": config.max_output_tokens,
         "models": {

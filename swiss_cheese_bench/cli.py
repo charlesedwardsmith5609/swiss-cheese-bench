@@ -15,7 +15,7 @@ from swiss_cheese_bench.fixtures import FixtureError, load_fixtures
 from swiss_cheese_bench.providers import Provider, ProviderError, make_provider
 from swiss_cheese_bench.report import render_chart, render_report
 from swiss_cheese_bench.runner import run_bench
-from swiss_cheese_bench.scoring import ScoringError, score_run
+from swiss_cheese_bench.scoring import ScoringError, score_slices
 
 
 def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None) -> int:
@@ -26,24 +26,37 @@ def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None
     run.add_argument("--fixtures", type=Path, default=Path("fixtures"))
     run.add_argument("--out", type=Path, default=Path("runs/latest"))
     run.add_argument("--cap-usd", type=float, default=None, help="override the config cap")
+    run.add_argument(
+        "--tier", choices=["easy", "hard", "all"], default="easy", help="which fixtures to run"
+    )
     run.add_argument("--dry-run", action="store_true", help="no network, nothing spent")
     rep = sub.add_parser("report", help="score a finished run and write a Markdown report")
     rep.add_argument("--run", type=Path, required=True, help="run directory")
     rep.add_argument("--fixtures", type=Path, default=Path("fixtures"))
     rep.add_argument("--out", type=Path, default=Path("report.md"))
+    rep.add_argument(
+        "--tier",
+        choices=["easy", "hard", "all"],
+        default=None,
+        help="slice used for the chart (default: hard if the run has it, else easy)",
+    )
     args = parser.parse_args(argv)
     if args.command == "report":
-        return _report(args.run, args.fixtures, args.out)
+        return _report(args.run, args.fixtures, args.out, args.tier)
     environ = os.environ if env is None else env
     try:
         config = load_config(args.config)
         if args.cap_usd is not None:
             config = dataclasses.replace(config, cap_usd=args.cap_usd)
         fixtures = load_fixtures(args.fixtures)
+        if args.tier != "all":
+            fixtures = [f for f in fixtures if f.tier == args.tier]
+        if not fixtures:
+            raise FixtureError(f"no fixtures in tier {args.tier!r}")
         providers: dict[str, Provider] = {
             key: make_provider(spec, environ, args.dry_run) for key, spec in config.models.items()
         }
-        summary = run_bench(fixtures, config, providers, args.out, args.dry_run)
+        summary = run_bench(fixtures, config, providers, args.out, args.dry_run, args.tier)
     except (ConfigError, FixtureError, ProviderError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -57,13 +70,16 @@ def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None
     return 0
 
 
-def _report(run_dir: Path, fixtures_dir: Path, out: Path) -> int:
+def _report(run_dir: Path, fixtures_dir: Path, out: Path, tier: str | None) -> int:
     """Render both files first, then replace them in place; any failure leaves no half report."""
     chart_path = out.with_name(out.stem + ".chart.svg")
     try:
-        scoring = score_run(run_dir, load_fixtures(fixtures_dir))
-        chart = render_chart(scoring)
-        markdown = render_report(scoring, chart_path.name)
+        slices = score_slices(run_dir, load_fixtures(fixtures_dir))
+        chart_tier = tier or next(t for t in ("hard", "easy", "all") if t in slices)
+        if chart_tier not in slices:
+            raise ScoringError(f"the run has no {chart_tier!r} slice (has {sorted(slices)})")
+        chart = render_chart(slices[chart_tier])
+        markdown = render_report(slices, chart_path.name)
         staged: list[tuple[Path, Path]] = []
         try:
             for target, text in ((chart_path, chart), (out, markdown)):

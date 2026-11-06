@@ -35,3 +35,16 @@ confirm these interactively; see DECISIONS.md D-01.
 - `bash scripts/check.sh` must pass (ruff check, ruff format --check, mypy, pytest).
 - Behavioral tests through real interfaces (real HTTP on 127.0.0.1 port 0 for adapters).
 - Fixtures in Go/Terraform are data files only; they are not compiled or executed.
+
+## R5 Harder fixtures (added after the first live run)
+First live run (runs/live-2): both models caught 20/20 seeded defects, so the set cannot
+discriminate between configs. Goal: add a "hard" tier where a single strong reviewer misses some
+defects, keeping the original tier for comparison.
+- Same 8 defect categories; each hard fixture still has exactly one seeded defect.
+- Defects are subtle and buried: multi-file diffs (3-6 files, roughly 100-250 changed lines) that
+  mix refactors/renames/formatting and legitimate related changes with the defect.
+- Hard clean controls contain suspicious-looking but correct code (justified broad `except`,
+  a wildcard in a Deny statement, legitimately expected literals in tests) to stress precision.
+- Success criterion (measured, not assumed): on a live pilot, single-model recall on the hard tier
+  is clearly below 100% (target roughly 40-80%) with at least some disagreement between A and B.
+- Scoring and report show easy and hard tiers separately and combined.

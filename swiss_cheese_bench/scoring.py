@@ -64,6 +64,7 @@ class RunMeta:
     cap_usd: float
     models: dict[str, dict[str, object]]
     summary: dict[str, object]
+    manifest: tuple[str, ...] | None = None  # fixture ids run; None for legacy (easy-only) runs
 
 
 @dataclass(frozen=True)
@@ -238,6 +239,17 @@ def _row(raw: object, lineno: int, dry_run: bool) -> CallRow:
     )
 
 
+def resolve_run_fixtures(meta: RunMeta, fixtures: list[Fixture]) -> list[Fixture]:
+    """The fixtures a run covered: its manifest, or (legacy runs) the easy tier."""
+    if meta.manifest is None:
+        return [f for f in fixtures if f.tier == "easy"]
+    by_id = {f.id: f for f in fixtures}
+    missing = [i for i in meta.manifest if i not in by_id]
+    if missing:
+        raise ScoringError(f"run manifest names fixtures not on disk, e.g. {missing[0]!r}")
+    return [by_id[i] for i in sorted(set(meta.manifest))]
+
+
 def load_results(run_dir: Path, fixtures: list[Fixture]) -> tuple[RunMeta, list[CallRow]]:
     try:
         meta_raw = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
@@ -254,7 +266,16 @@ def load_results(run_dir: Path, fixtures: list[Fixture]) -> tuple[RunMeta, list[
         raise ScoringError("run.json has no summary: the run was interrupted or is not finalized")
     if not isinstance(models, dict):
         raise ScoringError("run.json: models must be an object")
-    meta = RunMeta(meta_raw["dry_run"], _num(meta_raw.get("cap_usd"), "cap_usd"), models, summary)
+    manifest_raw = meta_raw.get("manifest")
+    manifest: tuple[str, ...] | None = None
+    if manifest_raw is not None:
+        if not isinstance(manifest_raw, list) or not all(isinstance(x, str) for x in manifest_raw):
+            raise ScoringError("run.json: manifest must be a list of fixture ids")
+        manifest = tuple(manifest_raw)
+    meta = RunMeta(
+        meta_raw["dry_run"], _num(meta_raw.get("cap_usd"), "cap_usd"), models, summary, manifest
+    )
+    fixtures = resolve_run_fixtures(meta, fixtures)
     known = {f.id for f in fixtures}
     rows: list[CallRow] = []
     seen: set[tuple[str, str]] = set()
@@ -317,8 +338,14 @@ def _correct(fixture: Fixture, found: frozenset[tuple[Category, str | None]]) ->
     return label.category is not Category.NONE and (label.category, label.file) in found
 
 
-def score_run(run_dir: Path, fixtures: list[Fixture]) -> Scoring:
+def score_run(run_dir: Path, fixtures: list[Fixture], tier: str | None = None) -> Scoring:
+    """Score one slice: the given tier, or every fixture the run covered when tier is None."""
     meta, rows = load_results(run_dir, fixtures)
+    fixtures = resolve_run_fixtures(meta, fixtures)
+    if tier is not None:
+        fixtures = [f for f in fixtures if f.tier == tier]
+        if not fixtures:
+            raise ScoringError(f"the run has no fixtures in tier {tier!r}")
     by_fixture: dict[str, dict[str, CallRow]] = {}
     for row in rows:
         by_fixture.setdefault(row.fixture_id, {})[row.kind] = row
@@ -385,3 +412,14 @@ def score_run(run_dir: Path, fixtures: list[Fixture]) -> Scoring:
             Marginal(pair, best, extra, extra_cost, extra_cost / extra if extra > 0 else None)
         )
     return result
+
+
+def score_slices(run_dir: Path, fixtures: list[Fixture]) -> dict[str, Scoring]:
+    """Complete scorings for each tier the run covered, plus "all" when more than one."""
+    meta, _rows = load_results(run_dir, fixtures)
+    covered = resolve_run_fixtures(meta, fixtures)
+    tiers = [t for t in ("easy", "hard") if any(f.tier == t for f in covered)]
+    slices = {t: score_run(run_dir, fixtures, t) for t in tiers}
+    if len(tiers) > 1:
+        slices["all"] = score_run(run_dir, fixtures)
+    return slices

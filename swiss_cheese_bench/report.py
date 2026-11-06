@@ -145,10 +145,83 @@ def _summary_rows(scoring: Scoring) -> list[str]:
     return lines
 
 
-def render_report(scoring: Scoring, chart_ref: str) -> str:
-    meta = scoring.meta
+def _slice_body(scoring: Scoring, h: str) -> list[str]:
+    out: list[str] = []
+    out += ["", h + " Summary by reviewer config", ""] + _summary_rows(scoring) + [""]
+
+    single_best = scoring.marginal[0].best_single if scoring.marginal else "A"
+    out += [h + " Does pairing help?", ""]
+    for m in scoring.marginal:
+        gain = (
+            f"{m.extra_catches:+d} catches vs the best single model ({single_best})"
+            f" for {'a saving of ' if m.extra_cost_usd < 0 else ''}${abs(m.extra_cost_usd):.4f}"
+        )
+        per = f" (${m.cost_per_extra_catch:.4f} per extra catch)" if m.cost_per_extra_catch else ""
+        out.append(f"- **{CONFIG_LABEL[m.config]}**: {gain}{per}")
+    out += [
+        "",
+        f"With only {scoring.configs['A'].overall.truth} seeded defects, differences of one or two "
+        "catches are within noise (see the Wilson intervals above). Treat this as a measurement "
+        "of this fixture set, not a general claim.",
+        "",
+        h + " Precision and recall by category",
+        "",
+        "| category | " + " | ".join(f"{CONFIG_LABEL[c]} P / R" for c in CONFIGS) + " |",
+        "|---|" + "---|" * len(CONFIGS),
+    ]
+    for cat in [str(c) for c in DEFECT_CATEGORIES] + [OVERALL]:
+        cells = []
+        for name in CONFIGS:
+            s = scoring.configs[name].categories[cat]
+            cells.append(f"{pct(s.precision)} / {pct(s.recall)} ({s.tp}/{s.truth})")
+        out.append(f"| {cat} | " + " | ".join(cells) + " |")
+    out += [
+        "",
+        h + " Overlap and blind-spot matrix (A vs B)",
+        "",
+        "Counts of seeded defects by who caught them. The last column shows how many of each "
+        "bucket the sequential A-then-B review caught.",
+        "",
+        "| category | both | A only | B only | neither | A then B caught (both/A/B/neither) |",
+        "|---|---|---|---|---|---|",
+    ]
+    for r in scoring.overlap:
+        caught = "/".join(str(r.a_then_b_caught[b]) for b in BUCKETS)
+        out.append(
+            f"| {r.category} | {r.counts['both']} | {r.counts['A_only']} | {r.counts['B_only']} "
+            f"| {r.counts['neither']} | {caught} |"
+        )
+    spots = scoring.blind_spots
+    spots = scoring.blind_spots
+    out += [
+        "",
+        "Blind spots (defects neither model caught): "
+        + (", ".join(f"`{s}`" for s in spots) if spots else "none"),
+        "",
+    ]
+    return out
+
+
+def _cohort_lines(scoring: Scoring) -> list[str]:
+    lines = [
+        f"- Cohort: {len(scoring.cohort)} fixtures scored by every config; "
+        f"{len(scoring.excluded)} excluded"
+    ]
+    for fid, why in sorted(scoring.excluded.items()):
+        lines.append(f"  - excluded `{md_cell(fid)}`: {md_cell(why)}")
+    return lines
+
+
+TIER_TITLE = {"hard": "Hard tier", "easy": "Easy tier", "all": "All fixtures combined"}
+
+
+def render_report(scoring: Scoring | dict[str, Scoring], chart_ref: str) -> str:
+    """One Scoring renders as before; a dict of slices renders hard, easy, then all."""
+    slices = {"": scoring} if isinstance(scoring, Scoring) else scoring
+    first = next(iter(slices.values()))
+    meta = first.meta
     out: list[str] = ["# swiss-cheese-bench report", ""]
-    if scoring.dry_run:
+    if first.dry_run:
         out += [
             "> **SIMULATED RESULTS (dry run).** No model was called and nothing was spent. The "
             "findings come from a deterministic fake reviewer, so every number below only "
@@ -165,64 +238,22 @@ def render_report(scoring: Scoring, chart_ref: str) -> str:
         f"- Model B: `{md_cell(_model_field(meta.models, 'B', 'provider'))}` / "
         f"`{md_cell(_model_field(meta.models, 'B', 'model_id'))}`",
         f"- Cost cap: ${meta.cap_usd:.2f}; actual spend: ${spent:.4f}",
-        f"- Cohort: {len(scoring.cohort)} fixtures scored by every config; "
-        f"{len(scoring.excluded)} excluded",
     ]
-    for fid, why in sorted(scoring.excluded.items()):
-        out.append(f"  - excluded `{md_cell(fid)}`: {md_cell(why)}")
-    out += ["", "## Summary by reviewer config", ""] + _summary_rows(scoring) + [""]
-
-    single_best = scoring.marginal[0].best_single if scoring.marginal else "A"
-    out += ["## Does pairing help?", ""]
-    for m in scoring.marginal:
-        gain = (
-            f"{m.extra_catches:+d} catches vs the best single model ({single_best})"
-            f" for {'a saving of ' if m.extra_cost_usd < 0 else ''}${abs(m.extra_cost_usd):.4f}"
-        )
-        per = f" (${m.cost_per_extra_catch:.4f} per extra catch)" if m.cost_per_extra_catch else ""
-        out.append(f"- **{CONFIG_LABEL[m.config]}**: {gain}{per}")
+    if isinstance(scoring, Scoring):
+        out += _cohort_lines(scoring)
+        out += _slice_body(scoring, "##")
+    else:
+        order = [t for t in ("hard", "easy", "all") if t in slices]
+        for tier in order:
+            out += ["", f"## {TIER_TITLE[tier]}", ""] + _cohort_lines(slices[tier])
+            out += _slice_body(slices[tier], "###")
+    chart_title = "Recall by defect category" + (
+        "" if isinstance(scoring, Scoring) else f" ({TIER_TITLE[order[0]].lower()})"
+    )
     out += [
-        "",
-        f"With only {scoring.configs['A'].overall.truth} seeded defects, differences of one or two "
-        "catches are within noise (see the Wilson intervals above). Treat this as a measurement "
-        "of this fixture set, not a general claim.",
-        "",
-        "## Precision and recall by category",
-        "",
-        "| category | " + " | ".join(f"{CONFIG_LABEL[c]} P / R" for c in CONFIGS) + " |",
-        "|---|" + "---|" * len(CONFIGS),
-    ]
-    for cat in [str(c) for c in DEFECT_CATEGORIES] + [OVERALL]:
-        cells = []
-        for name in CONFIGS:
-            s = scoring.configs[name].categories[cat]
-            cells.append(f"{pct(s.precision)} / {pct(s.recall)} ({s.tp}/{s.truth})")
-        out.append(f"| {cat} | " + " | ".join(cells) + " |")
-    out += [
-        "",
-        "## Overlap and blind-spot matrix (A vs B)",
-        "",
-        "Counts of seeded defects by who caught them. The last column shows how many of each "
-        "bucket the sequential A-then-B review caught.",
-        "",
-        "| category | both | A only | B only | neither | A then B caught (both/A/B/neither) |",
-        "|---|---|---|---|---|---|",
-    ]
-    for r in scoring.overlap:
-        caught = "/".join(str(r.a_then_b_caught[b]) for b in BUCKETS)
-        out.append(
-            f"| {r.category} | {r.counts['both']} | {r.counts['A_only']} | {r.counts['B_only']} "
-            f"| {r.counts['neither']} | {caught} |"
-        )
-    spots = scoring.blind_spots
-    out += [
-        "",
-        "Blind spots (defects neither model caught): "
-        + (", ".join(f"`{s}`" for s in spots) if spots else "none"),
-        "",
         "## Chart",
         "",
-        f"![Recall by defect category]({chart_ref})",
+        f"![{chart_title}]({chart_ref})",
         "",
         "## Method notes",
         "",
@@ -233,9 +264,10 @@ def render_report(scoring: Scoring, chart_ref: str) -> str:
         "cost-cap skips are unscored; unparsable model output counts as a miss.",
         "- Precision includes findings on clean control fixtures. `n/a` means the denominator "
         "was zero.",
-        "- Cost per true catch divides ALL cost incurred (including failed calls and fixtures "
-        "outside the cohort) by cohort catches, so it can overstate cost. A then B includes "
-        "A's call cost plus B's follow-up call.",
+        "- Cost per true catch divides ALL cost incurred on the slice's fixtures (including failed "
+        "calls and fixtures outside the cohort) by cohort catches, so it can overstate cost. "
+        "Each slice counts only its own fixtures' calls. A then B includes A's call cost plus "
+        "B's follow-up call.",
         "- A ∪ B merges independent A and B findings; A then B shows B A's findings and uses "
         "B's final list.",
         "",

@@ -42,7 +42,7 @@ def test_all_fixtures_load_and_ids_match_dirs() -> None:
 
 
 def test_inventory_counts_are_exact() -> None:
-    fixtures = load_fixtures(ROOT)
+    fixtures = [f for f in load_fixtures(ROOT) if f.tier == "easy"]
     got: dict[str, list[str]] = {}
     clean: list[str] = []
     for f in fixtures:

@@ -18,7 +18,7 @@ from swiss_cheese_bench.scoring import (
 )
 
 ROOT = Path(__file__).resolve().parent.parent / "fixtures"
-FIXTURES = load_fixtures(ROOT)
+FIXTURES = [f for f in load_fixtures(ROOT) if f.tier == "easy"]
 DEFECTIVE = [f for f in FIXTURES if f.label.category is not Category.NONE]
 CLEAN = [f for f in FIXTURES if f.label.category is Category.NONE]
 
@@ -55,9 +55,17 @@ def row(f: Fixture, kind: str, **over: Any) -> dict[str, Any]:
     return base
 
 
-def write_run(tmp: Path, behave: Behaviour, dry_run: bool = False, finalize: bool = True) -> Path:
+def write_run(
+    tmp: Path,
+    behave: Behaviour,
+    dry_run: bool = False,
+    finalize: bool = True,
+    fixtures: list[Fixture] | None = None,
+    manifest: bool = False,
+) -> Path:
+    tmp.mkdir(parents=True, exist_ok=True)
     lines = []
-    for f in FIXTURES:
+    for f in fixtures if fixtures is not None else FIXTURES:
         for kind in ("A", "B", "B_after_A"):
             r = row(f, kind, **behave(f, kind))
             if dry_run:
@@ -68,6 +76,8 @@ def write_run(tmp: Path, behave: Behaviour, dry_run: bool = False, finalize: boo
             lines.append(json.dumps(r))
     (tmp / "results.jsonl").write_text("\n".join(lines) + "\n")
     meta: dict[str, Any] = {"dry_run": dry_run, "cap_usd": 5.0, "models": {}}
+    if manifest:
+        meta["manifest"] = sorted(f.id for f in (fixtures if fixtures is not None else FIXTURES))
     if finalize:
         meta["summary"] = {}
     (tmp / "run.json").write_text(json.dumps(meta))

@@ -19,6 +19,7 @@ GIT_TIMEOUT_S = 30
 MAX_FIXTURES = 1000
 MAX_FILE_BYTES = 256 * 1024
 LANGUAGES = frozenset({"python", "go", "terraform"})
+TIERS = ("easy", "hard")
 
 
 class FixtureError(Exception):
@@ -46,6 +47,7 @@ class Label:
     file: str | None = None
     description: str | None = None
     evidence: str | None = None
+    tier: str = "easy"
 
 
 @dataclass(frozen=True)
@@ -57,6 +59,10 @@ class Fixture:
     diff: str
     base_dir: Path
     after_dir: Path
+
+    @property
+    def tier(self) -> str:
+        return self.label.tier
 
 
 @dataclass
@@ -177,6 +183,9 @@ def _load_label(data: dict[str, object], fixture_id: str) -> Label:
         category = Category(raw)
     except ValueError as exc:
         raise FixtureError(f"{fixture_id}: unknown category '{raw}'") from exc
+    tier = data.get("tier", "easy")
+    if tier not in TIERS:
+        raise FixtureError(f"{fixture_id}: tier must be one of {TIERS}")
     file = _opt_str(data, "file", fixture_id)
     description = _opt_str(data, "description", fixture_id)
     evidence = _opt_str(data, "evidence", fixture_id)
@@ -185,7 +194,7 @@ def _load_label(data: dict[str, object], fixture_id: str) -> Label:
         raise FixtureError(f"{fixture_id}: clean control must not have file/description/evidence")
     if category is not Category.NONE and not all(present):
         raise FixtureError(f"{fixture_id}: defective fixture needs file, description, evidence")
-    return Label(category, file, description, evidence)
+    return Label(category, file, description, evidence, str(tier))
 
 
 def validate(fixture: Fixture) -> None:
@@ -232,7 +241,7 @@ def load_fixture(directory: Path) -> Fixture:
 def load_fixtures(root: Path) -> list[Fixture]:
     if not root.is_dir():
         raise FixtureError(f"fixtures root not found: {root}")
-    dirs = sorted(p for p in root.iterdir() if p.is_dir())
+    dirs = sorted(p for p in root.iterdir() if p.is_dir() and not p.name.startswith("."))
     if len(dirs) > MAX_FIXTURES:
         raise FixtureError(f"too many fixtures ({len(dirs)} > {MAX_FIXTURES})")
     return [load_fixture(d) for d in dirs]
@@ -241,7 +250,7 @@ def load_fixtures(root: Path) -> list[Fixture]:
 def regen(root: Path) -> int:
     """Rewrite diff.patch for every fixture directory under root. Returns the count."""
     count = 0
-    for directory in sorted(p for p in root.iterdir() if p.is_dir()):
+    for directory in sorted(p for p in root.iterdir() if p.is_dir() and not p.name.startswith(".")):
         diff = make_diff(directory / "base", directory / "after")
         (directory / "diff.patch").write_text(diff, encoding="utf-8", newline="\n")
         count += 1
