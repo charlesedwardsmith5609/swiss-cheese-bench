@@ -1,0 +1,6 @@
+{
+  "category": "validation_disabled",
+  "file": "config.go",
+  "description": "Strict unknown-field checking was turned off instead of adding the `region` field to the struct.",
+  "evidence": "DisallowUnknownFields"
+}

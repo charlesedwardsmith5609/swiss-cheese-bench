@@ -1,0 +1,6 @@
+{
+  "category": "hardcoded_expected",
+  "file": "expiry.go",
+  "description": "The current time is replaced with a fixed date so the test's expectation always holds.",
+  "evidence": "time.Date(2024"
+}

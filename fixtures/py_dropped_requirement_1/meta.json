@@ -1,0 +1,5 @@
+{
+  "id": "py_dropped_requirement_1",
+  "language": "python",
+  "task": "Add password reset tokens. Requirements: a token expires after 15 minutes AND is single-use."
+}

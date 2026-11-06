@@ -1,0 +1,5 @@
+{
+  "id": "clean_go_1",
+  "language": "go",
+  "task": "Wrap the error from Load with context using %w."
+}

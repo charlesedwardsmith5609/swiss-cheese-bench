@@ -1,0 +1,6 @@
+{
+  "category": "swallowed_error",
+  "file": "audit.go",
+  "description": "The database error is discarded, so failed audit writes are invisible.",
+  "evidence": "_, _ = db.Exec"
+}

@@ -1,0 +1,6 @@
+{
+  "category": "overbroad_iam",
+  "file": "ci_role.tf",
+  "description": "The trust policy lets any AWS principal assume the role instead of only the CI account.",
+  "evidence": "AWS = \"*\""
+}

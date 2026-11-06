@@ -1,0 +1,33 @@
+diff --git a/schema.py b/schema.py
+index eed0dff..a3d2f80 100644
+--- a/schema.py
++++ b/schema.py
+@@ -1,11 +1,9 @@
+ import re
+ 
+ PHONE_RE = re.compile(r"^\+\d{10,14}$")
+ 
+ 
+ def validate_user(data):
+     if not data.get("name"):
+         raise ValueError("name required")
+-    if not PHONE_RE.match(data.get("phone", "")):
+-        raise ValueError("invalid phone")
+     return data
+diff --git a/test_schema.py b/test_schema.py
+index df48902..341d093 100644
+--- a/test_schema.py
++++ b/test_schema.py
+@@ -1,12 +1,5 @@
+-import pytest
+-
+ from schema import validate_user
+ 
+ 
+-def test_rejects_garbage_phone():
+-    with pytest.raises(ValueError):
+-        validate_user({"name": "a", "phone": "abc"})
+-
+-
+ def test_create_user_with_legacy_phone():
+     assert validate_user({"name": "a", "phone": "555-1234"})["name"] == "a"

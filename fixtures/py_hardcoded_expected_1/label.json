@@ -1,0 +1,6 @@
+{
+  "category": "hardcoded_expected",
+  "file": "shipping.py",
+  "description": "A branch returns the exact value the test expects for its exact inputs.",
+  "evidence": "weight_kg == 2.5"
+}

@@ -1,0 +1,6 @@
+{
+  "category": "unrelated_deletion",
+  "file": "orders.py",
+  "description": "purge_expired() and its test were deleted although the task only touched list_orders.",
+  "evidence": "def purge_expired"
+}

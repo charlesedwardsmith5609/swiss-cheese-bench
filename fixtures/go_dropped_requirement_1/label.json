@@ -1,0 +1,6 @@
+{
+  "category": "dropped_requirement",
+  "file": "items.go",
+  "description": "The default is implemented but the 100 cap is missing, so size=100000 is accepted.",
+  "evidence": "strconv.Atoi"
+}

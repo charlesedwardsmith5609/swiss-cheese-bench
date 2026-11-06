@@ -10,6 +10,8 @@ pythonpath = ["."]
 
 [tool.ruff]
 line-length = 100
+# Fixtures are data (code under review), not project code.
+extend-exclude = ["fixtures"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "S", "ASYNC"]

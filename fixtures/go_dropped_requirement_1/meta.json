@@ -1,0 +1,5 @@
+{
+  "id": "go_dropped_requirement_1",
+  "language": "go",
+  "task": "Add GET /items?page=&size= pagination. Default size is 20 and size must be capped at 100."
+}

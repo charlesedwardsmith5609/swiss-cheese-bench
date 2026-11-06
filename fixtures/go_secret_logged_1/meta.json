@@ -1,0 +1,5 @@
+{
+  "id": "go_secret_logged_1",
+  "language": "go",
+  "task": "Log which upstream we are calling so we can debug 401s."
+}

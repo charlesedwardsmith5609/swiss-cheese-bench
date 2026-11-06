@@ -1,0 +1,19 @@
+diff --git a/auth.py b/auth.py
+index 19b7233..85f7161 100644
+--- a/auth.py
++++ b/auth.py
+@@ -1,8 +1,13 @@
+ import hmac
++import logging
+ 
++log = logging.getLogger(__name__)
+ USERS = {"alice": "hunter2"}
+ 
+ 
+ def login(user, password):
++    log.info("login attempt user=%s password=%s", user, password)
+     expected = USERS.get(user, "")
+-    return hmac.compare_digest(expected, password)
++    ok = hmac.compare_digest(expected, password)
++    log.info("login result user=%s ok=%s", user, ok)
++    return ok

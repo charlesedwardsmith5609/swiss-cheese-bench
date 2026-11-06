@@ -1,0 +1,6 @@
+{
+  "category": "secret_logged",
+  "file": "upstream.go",
+  "description": "The bearer token is written to the log.",
+  "evidence": "cfg.APIToken"
+}

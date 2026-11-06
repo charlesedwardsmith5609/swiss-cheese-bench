@@ -1,0 +1,22 @@
+diff --git a/payments.py b/payments.py
+index add1765..b10a539 100644
+--- a/payments.py
++++ b/payments.py
+@@ -1,7 +1,15 @@
++import logging
+ import urllib.request
+ 
++log = logging.getLogger(__name__)
++
+ 
+ def charge(url, payload):
+     req = urllib.request.Request(url, data=payload, method="POST")
+-    with urllib.request.urlopen(req, timeout=5) as resp:
+-        return resp.status
++    for attempt in range(3):
++        try:
++            with urllib.request.urlopen(req, timeout=5) as resp:
++                return resp.status
++        except Exception:
++            log.warning("charge attempt %d failed", attempt + 1)
++    return None

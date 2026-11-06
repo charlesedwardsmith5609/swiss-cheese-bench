@@ -1,0 +1,5 @@
+{
+  "id": "tf_overbroad_iam_2",
+  "language": "terraform",
+  "task": "Create a role that the CI account can assume to deploy the ECS service."
+}

@@ -1,0 +1,5 @@
+{
+  "id": "clean_go_2",
+  "language": "go",
+  "task": "Cap the request body size at 1 MiB in the create handler."
+}

@@ -1,0 +1,5 @@
+{
+  "id": "clean_tf_1",
+  "language": "terraform",
+  "task": "Tag the uploads bucket with owner and environment, and block public access."
+}

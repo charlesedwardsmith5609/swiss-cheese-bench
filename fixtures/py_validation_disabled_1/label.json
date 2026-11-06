@@ -1,0 +1,6 @@
+{
+  "category": "validation_disabled",
+  "file": "schema.py",
+  "description": "The phone-format check was removed entirely instead of teaching it the legacy format.",
+  "evidence": "PHONE_RE.match"
+}

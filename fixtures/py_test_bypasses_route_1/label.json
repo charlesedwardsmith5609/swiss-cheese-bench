@@ -1,0 +1,6 @@
+{
+  "category": "test_bypasses_route",
+  "file": "test_users.py",
+  "description": "The test calls delete_user() directly, so the admin check in handle() is never exercised.",
+  "evidence": "delete_user(DB, 2)"
+}

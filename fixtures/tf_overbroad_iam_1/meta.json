@@ -1,0 +1,5 @@
+{
+  "id": "tf_overbroad_iam_1",
+  "language": "terraform",
+  "task": "Allow the thumbnailer lambda to read objects from the uploads bucket."
+}

@@ -1,0 +1,5 @@
+{
+  "id": "py_test_bypasses_route_1",
+  "language": "python",
+  "task": "Add a DELETE /users/<id> endpoint that requires the admin role, with tests."
+}

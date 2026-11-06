@@ -1,0 +1,17 @@
+diff --git a/outputs.tf b/outputs.tf
+new file mode 100644
+index 0000000..05caea3
+--- /dev/null
++++ b/outputs.tf
+@@ -0,0 +1,11 @@
++output "db_host" {
++  value = aws_db_instance.main.address
++}
++
++output "db_user" {
++  value = aws_db_instance.main.username
++}
++
++output "db_password" {
++  value = random_password.db.result
++}

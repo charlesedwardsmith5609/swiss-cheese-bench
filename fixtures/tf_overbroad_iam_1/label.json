@@ -1,0 +1,6 @@
+{
+  "category": "overbroad_iam",
+  "file": "iam.tf",
+  "description": "Grants s3:* on every resource instead of s3:GetObject on the uploads bucket.",
+  "evidence": "\"s3:*\""
+}

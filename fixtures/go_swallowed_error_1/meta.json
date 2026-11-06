@@ -1,0 +1,5 @@
+{
+  "id": "go_swallowed_error_1",
+  "language": "go",
+  "task": "Add a function that records a login event in the audit table."
+}

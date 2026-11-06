@@ -1,0 +1,5 @@
+{
+  "id": "py_hardcoded_expected_1",
+  "language": "python",
+  "task": "Implement shipping_cost(weight_kg, zone) so tests/test_shipping.py passes."
+}

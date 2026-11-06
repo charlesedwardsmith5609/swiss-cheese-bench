@@ -1,0 +1,6 @@
+{
+  "category": "secret_logged",
+  "file": "outputs.tf",
+  "description": "The generated DB password is emitted as a plain output (printed in plan/apply logs).",
+  "evidence": "random_password.db.result"
+}

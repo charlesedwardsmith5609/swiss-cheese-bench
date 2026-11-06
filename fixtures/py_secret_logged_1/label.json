@@ -1,0 +1,6 @@
+{
+  "category": "secret_logged",
+  "file": "auth.py",
+  "description": "The plaintext password is written to the log line.",
+  "evidence": "password=%s"
+}

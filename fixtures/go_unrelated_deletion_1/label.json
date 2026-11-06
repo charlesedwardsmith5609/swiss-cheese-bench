@@ -1,0 +1,6 @@
+{
+  "category": "unrelated_deletion",
+  "file": "middleware.go",
+  "description": "The Recover middleware (panic recovery) was deleted; it is unrelated to the task.",
+  "evidence": "func Recover"
+}

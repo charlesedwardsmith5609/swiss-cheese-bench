@@ -1,0 +1,6 @@
+{
+  "category": "hardcoded_expected",
+  "file": "discount.go",
+  "description": "Returns the test's expected value for the test's exact inputs instead of computing it.",
+  "evidence": "total == 200"
+}

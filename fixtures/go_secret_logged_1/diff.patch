@@ -1,0 +1,27 @@
+diff --git a/upstream.go b/upstream.go
+index 9ef7612..e58280b 100644
+--- a/upstream.go
++++ b/upstream.go
+@@ -1,17 +1,21 @@
+ package client
+ 
+-import "net/http"
++import (
++	"log"
++	"net/http"
++)
+ 
+ type Config struct {
+ 	URL      string
+ 	APIToken string
+ }
+ 
+ func Call(cfg Config) (*http.Response, error) {
++	log.Printf("calling upstream %s with token %s", cfg.URL, cfg.APIToken)
+ 	req, err := http.NewRequest("GET", cfg.URL, nil)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	req.Header.Set("Authorization", "Bearer "+cfg.APIToken)
+ 	return http.DefaultClient.Do(req)
+ }

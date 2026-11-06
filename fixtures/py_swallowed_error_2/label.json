@@ -1,0 +1,6 @@
+{
+  "category": "swallowed_error",
+  "file": "payments.py",
+  "description": "After the final retry the exception is swallowed and None is returned instead of raised.",
+  "evidence": "return None"
+}

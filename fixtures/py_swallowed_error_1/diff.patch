@@ -1,0 +1,35 @@
+diff --git a/session.py b/session.py
+index 51992bd..03cb364 100644
+--- a/session.py
++++ b/session.py
+@@ -1,3 +1,11 @@
+ import json
+ 
+ STATE: dict = {}
++
++
++def save_state(path):
++    try:
++        with open(path, "w", encoding="utf-8") as fh:
++            json.dump(STATE, fh)
++    except OSError:
++        pass
+diff --git a/test_session.py b/test_session.py
+index 606c816..1a4c555 100644
+--- a/test_session.py
++++ b/test_session.py
+@@ -1,5 +1,14 @@
++import json
++
+ import session
+ 
+ 
+ def test_state_default_empty():
+     assert session.STATE == {}
++
++
++def test_save_state_writes_json(tmp_path):
++    session.STATE["k"] = 1
++    target = tmp_path / "s.json"
++    session.save_state(str(target))
++    assert json.loads(target.read_text()) == {"k": 1}

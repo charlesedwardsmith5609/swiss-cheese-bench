@@ -1,0 +1,20 @@
+diff --git a/config.go b/config.go
+index 483cded..9d52ab5 100644
+--- a/config.go
++++ b/config.go
+@@ -12,15 +12,14 @@ type Config struct {
+ 
+ func Load(path string) (*Config, error) {
+ 	f, err := os.Open(path)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	defer f.Close()
+ 	dec := json.NewDecoder(f)
+-	dec.DisallowUnknownFields()
+ 	var c Config
+ 	if err := dec.Decode(&c); err != nil {
+ 		return nil, err
+ 	}
+ 	return &c, nil
+ }

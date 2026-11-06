@@ -1,0 +1,28 @@
+diff --git a/orders.py b/orders.py
+index c5f25cb..f927d9a 100644
+--- a/orders.py
++++ b/orders.py
+@@ -1,5 +1,5 @@
+ ORDERS: list[dict] = []
+ 
+ 
+-def list_orders(user_id):
+-    return [o for o in ORDERS if o["user"] == user_id]
++def list_orders(user_id, limit=50):
++    return [o for o in ORDERS if o["user"] == user_id][:limit]
+diff --git a/test_orders.py b/test_orders.py
+index d8d53a1..db959c5 100644
+--- a/test_orders.py
++++ b/test_orders.py
+@@ -1,6 +1,11 @@
+ import orders
+ 
+ 
+ def test_list_orders_filters_by_user():
+     orders.ORDERS[:] = [{"user": 1}, {"user": 2}]
+     assert len(orders.list_orders(1)) == 1
++
++
++def test_list_orders_respects_limit():
++    orders.ORDERS[:] = [{"user": 1} for _ in range(5)]
++    assert len(orders.list_orders(1, limit=2)) == 2

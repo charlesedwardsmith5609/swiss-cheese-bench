@@ -1,0 +1,6 @@
+{
+  "category": "swallowed_error",
+  "file": "session.py",
+  "description": "Write failures are silently ignored, so state can be lost with no signal.",
+  "evidence": "except OSError"
+}

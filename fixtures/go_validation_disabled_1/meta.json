@@ -1,0 +1,5 @@
+{
+  "id": "go_validation_disabled_1",
+  "language": "go",
+  "task": "Make TestLoadConfig pass for configs/staging.json, which has a new `region` field."
+}

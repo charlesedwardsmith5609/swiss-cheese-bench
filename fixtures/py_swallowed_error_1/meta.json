@@ -1,0 +1,5 @@
+{
+  "id": "py_swallowed_error_1",
+  "language": "python",
+  "task": "Persist session state to disk on shutdown."
+}

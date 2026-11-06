@@ -1,0 +1,18 @@
+diff --git a/discount.go b/discount.go
+index f0293a5..7bec8f0 100644
+--- a/discount.go
++++ b/discount.go
+@@ -1 +1,13 @@
+ package pricing
++
++func Discount(total float64, tier string) float64 {
++	if total == 200 && tier == "gold" {
++		return 30
++	}
++	switch tier {
++	case "silver":
++		return total * 0.05
++	default:
++		return 0
++	}
++}

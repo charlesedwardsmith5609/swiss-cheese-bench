@@ -1,0 +1,6 @@
+{
+  "category": "dropped_requirement",
+  "file": "reset.py",
+  "description": "Expiry was implemented but tokens are never invalidated after use, so they are reusable.",
+  "evidence": "def redeem_token"
+}

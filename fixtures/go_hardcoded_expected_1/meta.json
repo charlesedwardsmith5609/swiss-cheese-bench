@@ -1,0 +1,5 @@
+{
+  "id": "go_hardcoded_expected_1",
+  "language": "go",
+  "task": "Implement Discount(total, tier) so TestDiscount passes."
+}

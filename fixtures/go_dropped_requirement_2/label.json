@@ -1,0 +1,6 @@
+{
+  "category": "dropped_requirement",
+  "file": "ratelimit.go",
+  "description": "429 is returned but the required Retry-After header is never set.",
+  "evidence": "StatusTooManyRequests"
+}

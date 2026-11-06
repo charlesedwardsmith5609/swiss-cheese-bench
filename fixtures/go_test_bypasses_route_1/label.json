@@ -1,0 +1,6 @@
+{
+  "category": "test_bypasses_route",
+  "file": "orders_test.go",
+  "description": "The test calls createOrder directly, skipping the router, auth middleware and JSON decoding.",
+  "evidence": "createOrder(&store, Order"
+}
