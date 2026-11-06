@@ -10,6 +10,7 @@ found in it.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
@@ -32,6 +33,8 @@ from swiss_cheese_bench.scoring import (
 
 DEFAULT_MODEL = "grok-4.7-medium-fast"
 MAX_RETRIES = 2
+SCHEMA_VERSION = 2
+MAX_JOBS = 8
 SAMPLE_EVERY = 4
 FAMILY_PREFIXES = (
     ("claude", "anthropic"),
@@ -137,6 +140,38 @@ def parse_verdicts(text: str, count: int) -> tuple[list[tuple[str, str]], bool]:
     return out, parsed_any
 
 
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _take_lock(lock: Path) -> None:
+    """Exclusive lock file holding our pid; a lock left by a dead process is taken over."""
+    for _ in range(2):
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                owner = int(lock.read_text(encoding="utf-8").strip() or "0")
+            except (OSError, ValueError):
+                owner = 0
+            if owner and _pid_alive(owner):
+                raise AdjudicationError(
+                    f"another adjudication (pid {owner}) holds {lock}"
+                ) from None
+            lock.unlink(missing_ok=True)  # stale: the owner is gone
+            continue
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(str(os.getpid()))
+        return
+    raise AdjudicationError(f"cannot take {lock}")
+
+
 def _atomic_write(path: Path, text: str) -> None:
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".adj-", suffix=".tmp")
     try:
@@ -145,6 +180,22 @@ def _atomic_write(path: Path, text: str) -> None:
         os.replace(tmp, path)
     finally:
         Path(tmp).unlink(missing_ok=True)
+
+
+def _fixture_key(fixture: Fixture, claims: list[Claim], model: str, results_fp: str) -> str:
+    """Cache key: results + model + schema + fixture content + the exact claims."""
+    payload = json.dumps(
+        {
+            "schema": SCHEMA_VERSION,
+            "results": results_fp,
+            "model": model,
+            "task": fixture.task,
+            "diff": fixture.diff,
+            "claims": [[c.id, str(c.category), c.file, c.message] for c in claims],
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _judge_fixture(
@@ -175,6 +226,21 @@ def _judge_fixture(
     )
 
 
+def _flat(text: object, limit: int = 400) -> str:
+    """One line, no markdown-active newlines; backticks neutralised."""
+    return " ".join(str(text).split()).replace("`", "'")[:limit]
+
+
+def _fence(lines: list[str]) -> str:
+    longest = 0
+    for line in lines:
+        run = 0
+        for ch in line:
+            run = run + 1 if ch == "`" else 0
+            longest = max(longest, run)
+    return "`" * max(3, longest + 1)
+
+
 def _sample_md(
     items: list[dict[str, str]], claims: dict[str, Claim], fixtures: dict[str, Fixture]
 ) -> str:
@@ -188,13 +254,14 @@ def _sample_md(
         claim = claims[item["claim_id"]]
         fixture = fixtures[claim.fixture_id]
         lines += [
-            f"## {claim.id}: {item['verdict']}",
+            f"## {_flat(claim.id, 200)}: {_flat(item['verdict'], 20)}",
             "",
-            f"- claim: {claim.category} @ {claim.file or 'no file'}: {claim.message}",
-            f"- reason: {item['reason']}",
+            f"- claim: {claim.category} @ {_flat(claim.file or 'no file', 200)}: "
+            f"{_flat(claim.message)}",
+            f"- reason: {_flat(item['reason'])}",
             "",
-            "```diff",
         ]
+        fence_at = len(lines)
         diff_lines = fixture.diff.splitlines()
         shown: list[str] = []
         if claim.file:
@@ -209,7 +276,9 @@ def _sample_md(
         else:
             lines.insert(len(lines) - 1, "- (no matching file in the diff: showing the diff start)")
             shown = diff_lines[:60]
-        lines += shown + ["```", ""]
+        fence = _fence(shown)
+        lines.insert(fence_at, f"{fence}diff")
+        lines += shown + [fence, ""]
     return "\n".join(lines)
 
 
@@ -228,6 +297,8 @@ def adjudicate_run(
         raw_meta = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
     except (OSError, ValueError, ScoringError) as exc:
         raise AdjudicationError(f"cannot read the run: {exc}") from exc
+    if not 1 <= jobs <= MAX_JOBS:
+        raise AdjudicationError(f"jobs must be between 1 and {MAX_JOBS}")
     check_family(meta.models, model)
     fixtures = resolve_run_fixtures(meta, all_fixtures)
     claims = claims_from_rows(rows, fixtures)
@@ -236,44 +307,51 @@ def adjudicate_run(
         by_fixture.setdefault(claim.fixture_id, []).append(claim)
     fingerprint = results_fingerprint(run_dir)
     final = run_dir / "adjudication.json"
-    if final.exists() and not force:
-        raise AdjudicationError(f"{final} exists; use --force to redo it")
     lock = run_dir / ".adjudicate.lock"
+    _take_lock(lock)
     try:
-        os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
-    except FileExistsError as exc:
-        raise AdjudicationError(f"another adjudication holds {lock}") from exc
-    try:
+        # re-check after taking the lock: a concurrent run may have just finished
+        if final.exists() and not force:
+            raise AdjudicationError(f"{final} exists; use --force to redo it")
         per_dir = run_dir / "adjudication"
         per_dir.mkdir(exist_ok=True)
         fx_by_id = {f.id: f for f in fixtures}
+        keys = {
+            fid: _fixture_key(fx_by_id[fid], fclaims, model, fingerprint)
+            for fid, fclaims in by_fixture.items()
+        }
         todo = []
         for fid, fclaims in sorted(by_fixture.items()):
             out_file = per_dir / f"{fid}.json"
             if out_file.exists() and not force:
                 try:
-                    if json.loads(out_file.read_text(encoding="utf-8")).get("fingerprint") == (
-                        fingerprint
-                    ):
+                    cached = json.loads(out_file.read_text(encoding="utf-8"))
+                    if cached.get("fingerprint") == keys[fid]:
                         continue
                 except (OSError, ValueError):
                     pass
             todo.append((fx_by_id[fid], fclaims, out_file))
         work_dir = run_dir / "adjudication-work"
-        errors: list[str] = []
 
         def task(args: tuple[Fixture, list[Claim], Path]) -> str | None:
             fixture, fclaims, out_file = args
             try:
                 _judge_fixture(
-                    fixture, fclaims, model, fingerprint, out_file, work_dir, agent_bin, timeout_s
+                    fixture,
+                    fclaims,
+                    model,
+                    keys[fixture.id],
+                    out_file,
+                    work_dir,
+                    agent_bin,
+                    timeout_s,
                 )
             except AuthoringError as exc:
                 return f"{fixture.id}: {exc}"
             print(f"{fixture.id}: adjudicated {len(fclaims)} claims", file=sys.stderr)
             return None
 
-        with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
             errors = [e for e in pool.map(task, todo) if e]
         if errors:
             raise AdjudicationError(
@@ -282,7 +360,7 @@ def adjudicate_run(
         items: list[dict[str, str]] = []
         for fid in sorted(by_fixture):
             data = json.loads((per_dir / f"{fid}.json").read_text(encoding="utf-8"))
-            if data.get("fingerprint") != fingerprint:
+            if data.get("fingerprint") != keys[fid]:
                 raise AdjudicationError(f"stale per-fixture file for {fid}")
             for item in data["items"]:
                 items.append(
@@ -292,6 +370,9 @@ def adjudicate_run(
                         "reason": item.get("reason", ""),
                     }
                 )
+        claim_map = {c.id: c for c in claims}
+        # sample first; adjudication.json is renamed into place LAST as the commit marker
+        _atomic_write(run_dir / "adjudication_sample.md", _sample_md(items, claim_map, fx_by_id))
         _atomic_write(
             final,
             json.dumps(
@@ -305,8 +386,6 @@ def adjudicate_run(
             )
             + "\n",
         )
-        claim_map = {c.id: c for c in claims}
-        _atomic_write(run_dir / "adjudication_sample.md", _sample_md(items, claim_map, fx_by_id))
     finally:
         lock.unlink(missing_ok=True)
     return final

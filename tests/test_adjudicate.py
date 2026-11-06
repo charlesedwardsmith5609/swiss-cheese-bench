@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -291,9 +294,12 @@ def test_adjudicate_run_end_to_end_resume_and_guards(tmp_path: Path) -> None:
     final.unlink()
     with pytest.raises(AdjudicationError, match="same family"):
         adjudicate_run(run, ROOT, model="gpt-5", agent_bin=agent)
-    (run / ".adjudicate.lock").write_text("")
+    (run / ".adjudicate.lock").write_text(str(os.getpid()))  # held by a live process (us)
     with pytest.raises(AdjudicationError, match="another adjudication"):
         adjudicate_run(run, ROOT, model="grok-test", agent_bin=agent)
+    (run / ".adjudicate.lock").write_text(str(_dead_pid()))  # stale lock: taken over
+    adjudicate_run(run, ROOT, model="grok-test", agent_bin=agent, timeout_s=60)
+    assert not (run / ".adjudicate.lock").exists() and final.exists()
 
 
 def test_adjudicate_run_agent_failure_keeps_partial_and_releases_lock(tmp_path: Path) -> None:
@@ -310,3 +316,56 @@ def test_cli_adjudicate_errors_exit_2(tmp_path: Path, capsys: pytest.CaptureFixt
     run = make_run(tmp_path / "run")
     assert main(["adjudicate", "--run", str(run), "--model", "claude-opus-5-5"]) == 2
     assert "same family" in capsys.readouterr().err
+
+
+def _dead_pid() -> int:
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])  # noqa: S603
+    proc.wait(timeout=30)
+    return proc.pid
+
+
+def test_cache_is_keyed_on_the_model_and_jobs_are_bounded(tmp_path: Path) -> None:
+    run = make_run(tmp_path / "run")
+    log = tmp_path / "calls.log"
+    agent = fake_agent(tmp_path, AGENT_BODY.format(log=str(log)))
+    adjudicate_run(run, ROOT, model="grok-one", agent_bin=agent, timeout_s=60)
+    assert log.read_text().count("call") == 2
+    (run / "adjudication.json").unlink()
+    adjudicate_run(run, ROOT, model="grok-two", agent_bin=agent, timeout_s=60)
+    assert log.read_text().count("call") == 4  # new model => verdicts are not reused
+    assert json.loads((run / "adjudication.json").read_text())["adjudicator"] == "grok-two"
+    for bad in (0, 9, -1):
+        with pytest.raises(AdjudicationError, match="jobs"):
+            adjudicate_run(run, ROOT, model="grok-two", jobs=bad, agent_bin=agent)
+
+
+def test_sample_markdown_cannot_be_forged(tmp_path: Path) -> None:
+    from swiss_cheese_bench.adjudicate import _fence, _flat
+
+    assert "\n" not in _flat("a\n# FORGED HEADING\n[x](http://evil)")
+    assert "`" not in _flat("``` close")
+    assert _fence(["```` four ticks", "x"]) == "`````"
+    assert _fence(["plain"]) == "```"
+
+
+def test_adjusted_precision_never_exceeds_one_on_a_partial_run(tmp_path: Path) -> None:
+    d0 = DEFECTIVE[0]
+
+    def b(f: Fixture, kind: str) -> dict[str, Any]:
+        base = [] if f.label.category is Category.NONE else [truth(f)]
+        if f is d0 and kind == "A":
+            base += [fd("swallowed_error", "x.py", "A real extra")]
+        if f is d0 and kind == "B":
+            return {"status": "error", "findings": [], "cost_usd": 0.1}
+        return {"findings": base}
+
+    run = write_run(tmp_path, b)
+    meta = json.loads((run / "run.json").read_text())
+    meta["models"] = MODELS
+    (run / "run.json").write_text(json.dumps(meta))
+    write_adj(run, {f"{d0.id}/A/1": "real"})
+    s = score_run(run, FIXTURES)
+    assert d0.id not in s.cohort  # B failed there, so d0 is outside the common cohort
+    a = s.configs["A"]
+    assert a.extras is not None and a.extras.real == 1 and a.extras.real_in_cohort == 0
+    assert a.adjusted_precision is not None and a.adjusted_precision <= 1.0

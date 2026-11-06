@@ -156,3 +156,11 @@ Autonomous run. Each entry: what was decided, why, and how to reverse it.
   unchanged: strict file matching is deliberate and not changed after seeing results.
 - D-37 scripts/cross-review.sh now also excludes fixtures/ and reports/ from the diff it sends
   (fixture data swamped the 60k-char limit and hid the code from the reviewer).
+- D-38 Step-6 cross-review (code only, now that fixtures/reports are excluded): all 7 findings
+  fixed: adjusted precision uses real extras on the common cohort only (real_in_cohort) so it can
+  never exceed 100%; per-fixture adjudication cache keyed on results+model+schema+fixture
+  task/diff+claims; sample markdown flattened and fence-safe; lock file stores the owner pid and a
+  dead owner's lock is taken over; --jobs limited to 1-8; no-overwrite check repeated after taking
+  the lock; the sample is written first and adjudication.json last (commit marker).
+- D-39 reports/hard-1.md (+chart) committed as the record of the pilot run on the PRE-swap
+  fixtures; it includes the extras section. runs/ stays untracked.

@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="440" viewBox="0 0 920 440" role="img" aria-labelledby="t d" font-family="sans-serif" font-size="12">
+<title id="t">Recall by defect category</title>
+<desc id="d">Grouped bars: share of seeded defects caught per category by reviewer A, reviewer B, and A then B.</desc>
+<rect width="920" height="440" fill="#fcfcfb"/>
+<text x="60" y="24" font-size="15" font-weight="bold" fill="#222">Recall by defect category</text>
+<rect x="60" y="38" width="12" height="12" rx="2" fill="#0072B2"/>
+<text x="78" y="48" fill="#444">A</text>
+<rect x="190" y="38" width="12" height="12" rx="2" fill="#E69F00"/>
+<text x="208" y="48" fill="#444">B</text>
+<rect x="320" y="38" width="12" height="12" rx="2" fill="#009E73"/>
+<text x="338" y="48" fill="#444">A then B</text>
+<line x1="60" y1="330.0" x2="900" y2="330.0" stroke="#e3e3e0" stroke-width="1"/>
+<text x="52" y="334.0" text-anchor="end" fill="#666">0%</text>
+<line x1="60" y1="265.0" x2="900" y2="265.0" stroke="#e3e3e0" stroke-width="1"/>
+<text x="52" y="269.0" text-anchor="end" fill="#666">25%</text>
+<line x1="60" y1="200.0" x2="900" y2="200.0" stroke="#e3e3e0" stroke-width="1"/>
+<text x="52" y="204.0" text-anchor="end" fill="#666">50%</text>
+<line x1="60" y1="135.0" x2="900" y2="135.0" stroke="#e3e3e0" stroke-width="1"/>
+<text x="52" y="139.0" text-anchor="end" fill="#666">75%</text>
+<line x1="60" y1="70.0" x2="900" y2="70.0" stroke="#e3e3e0" stroke-width="1"/>
+<text x="52" y="74.0" text-anchor="end" fill="#666">100%</text>
+<rect class="bar" data-series="A" data-category="unrelated_deletion" data-recall="0.0000" x="85.5" y="330.0" width="16" height="0.0" fill="#0072B2"/>
+<text x="93.5" y="327.0" text-anchor="middle" font-size="10" fill="#333">0</text>
+<rect class="bar" data-series="B" data-category="unrelated_deletion" data-recall="0.0000" x="104.5" y="330.0" width="16" height="0.0" fill="#E69F00"/>
+<text x="112.5" y="327.0" text-anchor="middle" font-size="10" fill="#333">0</text>
+<rect class="bar" data-series="A_then_B" data-category="unrelated_deletion" data-recall="0.0000" x="123.5" y="330.0" width="16" height="0.0" fill="#009E73"/>
+<text x="131.5" y="327.0" text-anchor="middle" font-size="10" fill="#333">0</text>
+<text x="112.5" y="344" text-anchor="end" fill="#444" transform="rotate(-35 112.5 344)">unrelated_deletion</text>
+<rect class="bar" data-series="A" data-category="dropped_requirement" data-recall="1.0000" x="190.5" y="70.0" width="16" height="260.0" fill="#0072B2"/>
+<text x="198.5" y="67.0" text-anchor="middle" font-size="10" fill="#333">100</text>
+<rect class="bar" data-series="B" data-category="dropped_requirement" data-recall="1.0000" x="209.5" y="70.0" width="16" height="260.0" fill="#E69F00"/>
+<text x="217.5" y="67.0" text-anchor="middle" font-size="10" fill="#333">100</text>
+<rect class="bar" data-series="A_then_B" data-category="dropped_requirement" data-recall="1.0000" x="228.5" y="70.0" width="16" height="260.0" fill="#009E73"/>
+<text x="236.5" y="67.0" text-anchor="middle" font-size="10" fill="#333">100</text>
+<text x="217.5" y="344" text-anchor="end" fill="#444" transform="rotate(-35 217.5 344)">dropped_requirement</text>
+<rect class="bar" data-series="A" data-category="test_bypasses_route" data-recall="1.0000" x="295.5" y="70.0" width="16" height="260.0" fill="#0072B2"/>
+<text x="303.5" y="67.0" text-anchor="middle" font-size="10" fill="#333">100</text>
+<rect class="bar" data-series="B" data-category="test_bypasses_route" data-recall="1.0000" x="314.5" y="70.0" width="16" height="260.0" fill="#E69F00"/>
+<text x="322.5" y="67.0" text-anchor="middle" font-size="10" fill="#333">100</text>
+<rect class="bar" data-series="A_then_B" data-category="test_bypasses_route" data-recall="1.0000" x="333.5" y="70.0" width="16" height="260.0" fill="#009E73"/>
+<text x="341.5" y="67.0" text-anchor="middle" font-size="10" fill="#333">100</text>
+<text x="322.5" y="344" text-anchor="end" fill="#444" transform="rotate(-35 322.5 344)">test_bypasses_route</text>
+<rect class="bar" data-series="A" data-category="validation_disabled" data-recall="0.6667" x="400.5" y="156.7" width="16" height="173.3" fill="#0072B2"/>
+<text x="408.5" y="153.7" text-anchor="middle" font-size="10" fill="#333">67</text>
+<rect class="bar" data-series="B" data-category="validation_disabled" data-recall="0.6667" x="419.5" y="156.7" width="16" height="173.3" fill="#E69F00"/>
+<text x="427.5" y="153.7" text-anchor="middle" font-size="10" fill="#333">67</text>
+<rect class="bar" data-series="A_then_B" data-category="validation_disabled" data-recall="0.6667" x="438.5" y="156.7" width="16" height="173.3" fill="#009E73"/>
+<text x="446.5" y="153.7" text-anchor="middle" font-size="10" fill="#333">67</text>
+<text x="427.5" y="344" text-anchor="end" fill="#444" transform="rotate(-35 427.5 344)">validation_disabled</text>
+<rect class="bar" data-series="A" data-category="hardcoded_expected" data-recall="1.0000" x="505.5" y="70.0" width="16" height="260.0" fill="#0072B2"/>
+<text x="513.5" y="67.0" text-anchor="middle" font-size="10" fill="#333">100</text>
+<rect class="bar" data-series="B" data-category="hardcoded_expected" data-recall="1.0000" x="524.5" y="70.0" width="16" height="260.0" fill="#E69F00"/>
+<text x="532.5" y="67.0" text-anchor="middle" font-size="10" fill="#333">100</text>
+<rect class="bar" data-series="A_then_B" data-category="hardcoded_expected" data-recall="1.0000" x="543.5" y="70.0" width="16" height="260.0" fill="#009E73"/>
+<text x="551.5" y="67.0" text-anchor="middle" font-size="10" fill="#333">100</text>
+<text x="532.5" y="344" text-anchor="end" fill="#444" transform="rotate(-35 532.5 344)">hardcoded_expected</text>
+<rect class="bar" data-series="A" data-category="swallowed_error" data-recall="1.0000" x="610.5" y="70.0" width="16" height="260.0" fill="#0072B2"/>
+<text x="618.5" y="67.0" text-anchor="middle" font-size="10" fill="#333">100</text>
+<rect class="bar" data-series="B" data-category="swallowed_error" data-recall="1.0000" x="629.5" y="70.0" width="16" height="260.0" fill="#E69F00"/>
+<text x="637.5" y="67.0" text-anchor="middle" font-size="10" fill="#333">100</text>
+<rect class="bar" data-series="A_then_B" data-category="swallowed_error" data-recall="1.0000" x="648.5" y="70.0" width="16" height="260.0" fill="#009E73"/>
+<text x="656.5" y="67.0" text-anchor="middle" font-size="10" fill="#333">100</text>
+<text x="637.5" y="344" text-anchor="end" fill="#444" transform="rotate(-35 637.5 344)">swallowed_error</text>
+<rect class="bar" data-series="A" data-category="secret_logged" data-recall="0.6667" x="715.5" y="156.7" width="16" height="173.3" fill="#0072B2"/>
+<text x="723.5" y="153.7" text-anchor="middle" font-size="10" fill="#333">67</text>
+<rect class="bar" data-series="B" data-category="secret_logged" data-recall="0.6667" x="734.5" y="156.7" width="16" height="173.3" fill="#E69F00"/>
+<text x="742.5" y="153.7" text-anchor="middle" font-size="10" fill="#333">67</text>
+<rect class="bar" data-series="A_then_B" data-category="secret_logged" data-recall="0.6667" x="753.5" y="156.7" width="16" height="173.3" fill="#009E73"/>
+<text x="761.5" y="153.7" text-anchor="middle" font-size="10" fill="#333">67</text>
+<text x="742.5" y="344" text-anchor="end" fill="#444" transform="rotate(-35 742.5 344)">secret_logged</text>
+<rect class="bar" data-series="A" data-category="overbroad_iam" data-recall="1.0000" x="820.5" y="70.0" width="16" height="260.0" fill="#0072B2"/>
+<text x="828.5" y="67.0" text-anchor="middle" font-size="10" fill="#333">100</text>
+<rect class="bar" data-series="B" data-category="overbroad_iam" data-recall="1.0000" x="839.5" y="70.0" width="16" height="260.0" fill="#E69F00"/>
+<text x="847.5" y="67.0" text-anchor="middle" font-size="10" fill="#333">100</text>
+<rect class="bar" data-series="A_then_B" data-category="overbroad_iam" data-recall="1.0000" x="858.5" y="70.0" width="16" height="260.0" fill="#009E73"/>
+<text x="866.5" y="67.0" text-anchor="middle" font-size="10" fill="#333">100</text>
+<text x="847.5" y="344" text-anchor="end" fill="#444" transform="rotate(-35 847.5 344)">overbroad_iam</text>
+<line x1="60" y1="330" x2="900" y2="330" stroke="#888" stroke-width="1"/>
+</svg>

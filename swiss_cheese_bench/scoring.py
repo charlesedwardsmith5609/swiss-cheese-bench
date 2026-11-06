@@ -112,6 +112,7 @@ class ExtraCounts:
     real: int
     not_real: int
     unclear: int
+    real_in_cohort: int = 0  # real extras on the common cohort only (matches tp and predicted)
 
     @property
     def total(self) -> int:
@@ -154,7 +155,7 @@ class ConfigScore:
         """Precision counting adjudicated-real extras as correct (needs an adjudication)."""
         if self.extras is None or not self.overall.predicted:
             return None
-        return (self.overall.tp + self.extras.real) / self.overall.predicted
+        return (self.overall.tp + self.extras.real_in_cohort) / self.overall.predicted
 
     @property
     def cost_per_true_catch(self) -> float | None:
@@ -584,17 +585,22 @@ def _clusters(
 def apply_adjudication(
     result: Scoring, claims: list[Claim], adj: Adjudication, scored_by_config: dict[str, set[str]]
 ) -> Scoring:
+    cohort_ids = set(result.cohort)
     """Attach per-config extra counts and the A-vs-B extras overlap to a scored slice."""
     from dataclasses import replace
 
     new_configs: dict[str, ConfigScore] = {}
     for name, cfg in result.configs.items():
         clusters = _clusters(claims, adj, SOURCES[name], scored_by_config[name])
-        counts = [v for v in clusters.values()]
+        counts = list(clusters.values())
+        in_cohort = [v for key, v in clusters.items() if key[0] in cohort_ids]
         new_configs[name] = replace(
             cfg,
             extras=ExtraCounts(
-                counts.count("real"), counts.count("not_real"), counts.count("unclear")
+                counts.count("real"),
+                counts.count("not_real"),
+                counts.count("unclear"),
+                in_cohort.count("real"),
             ),
         )
     both_scored = scored_by_config["A"] & scored_by_config["B"]
