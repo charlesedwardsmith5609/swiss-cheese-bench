@@ -1,5 +1,5 @@
 {
   "id": "h_py_unrelated_deletion_2",
   "language": "python",
-  "task": "Move plain-text statement rendering out of the ledger into a new statements module so a collections letter can be built from an invoice without posting. Rename InvoiceLine.amt and Payment.amt to amount_cents so the statement columns match the payments table. Thread a posted_by clerk through issue, apply_payment, and void, and store that clerk on the audit entry instead of the customer account. Refresh the docstrings and order the imports to match the rest of the package."
+  "task": "Refactor invoice posting so each draft is stored as a numbered invoice keyed by account. Rename customer_id to account_id on drafts, invoices, and the ledger index, and store the clerk who posted the invoice on posted_by. Statement text must list every line with its own tax amount and finish with a totals block of subtotal, tax, and total. Refresh the module docstrings so they use the new field names."
 }

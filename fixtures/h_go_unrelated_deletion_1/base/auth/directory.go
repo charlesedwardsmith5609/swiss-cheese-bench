@@ -1,136 +1,84 @@
 package auth
 
 import (
-	"context"
-	"crypto/hmac"
-	"crypto/rand"
-	"crypto/sha256"
-	"crypto/subtle"
-	"encoding/hex"
-	"errors"
 	"sync"
 	"time"
 )
 
-const (
-	maxPasswordLen = 128
-	lockoutAfter   = 5
-	lockoutFor     = 15 * time.Minute
-)
-
-// ErrBadCredentials is returned for an unknown email or a wrong password.
-// ErrLocked is returned while a lockout window is still open.
-var (
-	ErrBadCredentials = errors.New("auth: bad credentials")
-	ErrLocked         = errors.New("auth: account locked")
-)
-
-// User is an account that can open browser sessions.
-type User struct {
-	ID           string
-	Email        string
-	passwordHash []byte
-	salt         []byte
-}
-
-// Directory is the in-memory account table and the failed-login counter.
+// Directory is the process-local session index.
 //
-// Directory owns its mutex. Authenticate and Add are safe for concurrent use.
+// mu guards sessions and hot. Callers in this package may lock mu only when
+// they do not already hold it. The service goroutine for a request is the
+// usual caller; the mutex exists so one Directory can be shared.
 type Directory struct {
 	mu       sync.Mutex
-	byEmail  map[string]*User
-	failures map[string]int
-	locked   map[string]time.Time
-	now      func() time.Time
+	sessions map[string]Session
+	hot      *cache
 }
 
-// NewDirectory returns an empty directory that stamps lockouts with time.Now.
+// NewDirectory returns an empty index.
 func NewDirectory() *Directory {
 	return &Directory{
-		byEmail:  make(map[string]*User),
-		failures: make(map[string]int),
-		locked:   make(map[string]time.Time),
-		now:      time.Now,
+		sessions: make(map[string]Session),
+		hot:      newCache(),
 	}
 }
 
-// Add registers an account. The password is stored as an HMAC under a random salt.
-func (d *Directory) Add(email, password string) (*User, error) {
-	if email == "" || password == "" || len(password) > maxPasswordLen {
-		return nil, errors.New("auth: invalid user")
-	}
+// Put inserts or replaces s in the index and the hot cache.
+func (d *Directory) Put(s Session) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if _, exists := d.byEmail[email]; exists {
-		return nil, errors.New("auth: user exists")
-	}
-	idBuf := make([]byte, 16)
-	if _, err := rand.Read(idBuf); err != nil {
-		return nil, err
-	}
-	salt := make([]byte, 16)
-	if _, err := rand.Read(salt); err != nil {
-		return nil, err
-	}
-	sum, err := mix(salt, password)
-	if err != nil {
-		return nil, err
-	}
-	user := &User{
-		ID:           hex.EncodeToString(idBuf),
-		Email:        email,
-		passwordHash: sum,
-		salt:         salt,
-	}
-	d.byEmail[email] = user
-	return user, nil
+	d.sessions[s.ID] = s
+	d.hot.put(s)
 }
 
-// Authenticate checks the password and applies the failed-login lockout.
-// A matching password clears the failure counter and any open lockout.
-func (d *Directory) Authenticate(ctx context.Context, email, password string) (*User, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if email == "" || password == "" || len(password) > maxPasswordLen {
-		return nil, ErrBadCredentials
-	}
+// Get returns the session for id when it exists and now is strictly before
+// expiry. A hot-cache hit is preferred so repeated authentications do not
+// walk the map.
+func (d *Directory) Get(id string, now time.Time) (Session, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	user, ok := d.byEmail[email]
+	if s, ok := d.hot.get(id); ok {
+		return checkFresh(s, now)
+	}
+	s, ok := d.sessions[id]
 	if !ok {
-		return nil, ErrBadCredentials
+		return Session{}, ErrNotFound
 	}
-	if until, locked := d.locked[email]; locked && d.clock().Before(until) {
-		return nil, ErrLocked
-	}
-	got, err := mix(user.salt, password)
+	checked, err := checkFresh(s, now)
 	if err != nil {
-		return nil, err
+		return Session{}, err
 	}
-	if subtle.ConstantTimeCompare(got, user.passwordHash) != 1 {
-		d.failures[email]++
-		if d.failures[email] >= lockoutAfter {
-			d.locked[email] = d.clock().Add(lockoutFor)
-		}
-		return nil, ErrBadCredentials
-	}
-	delete(d.failures, email)
-	delete(d.locked, email)
-	return user, nil
+	d.hot.put(checked)
+	return checked, nil
 }
 
-func (d *Directory) clock() time.Time {
-	if d.now == nil {
-		return time.Now()
+func checkFresh(s Session, now time.Time) (Session, error) {
+	if !now.Before(s.ExpiresAt) {
+		return Session{}, ErrExpired
 	}
-	return d.now()
+	return s, nil
 }
 
-func mix(salt []byte, password string) ([]byte, error) {
-	mac := hmac.New(sha256.New, salt)
-	if _, err := mac.Write([]byte(password)); err != nil {
-		return nil, err
-	}
-	return mac.Sum(nil), nil
+// Retire removes id from the index and from the hot cache.
+func (d *Directory) Retire(id string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.sessions, id)
+	d.hot.drop(id)
+}
+
+// Len reports how many sessions the authoritative index holds.
+func (d *Directory) Len() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.sessions)
+}
+
+// has reports whether id is present in the authoritative index.
+func (d *Directory) has(id string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	_, ok := d.sessions[id]
+	return ok
 }

@@ -1,70 +1,53 @@
-'''Order records accepted by the warehouse desk.
+"""Order records.
 
-Monetary amounts on an order are decimal dollars rounded to the cent.
-Quantities stay in integer warehouse units and match the WMS payload.
-'''
+The caller thread owns an OrderService and, through it, these records.
+Nothing in this package starts a thread or shares an order across tasks.
+Prices and totals are integer cents.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
 
 
-class Status(Enum):
-    '''Lifecycle of a customer order.'''
-
-    OPEN = 'open'
-    CANCELLED = 'cancelled'
-    FULFILLED = 'fulfilled'
+OPEN = "open"
+FULFILLED = "fulfilled"
+CANCELLED = "cancelled"
 
 
-class OrderError(Exception):
-    '''The desk rejected an order operation.'''
-
-
-@dataclass(frozen=True)
-class LineItem:
-    '''One SKU row on an order.
-
-    quantity is the pick count in warehouse units, never a pack multiple.
-    unit_price_cents is the catalog price captured at submit time.
-    '''
+@dataclass
+class Line:
+    """One SKU on an order. quantity is a unit count; prices are cents."""
 
     sku: str
     quantity: int
-    unit_price_cents: int
-
-
-@dataclass(frozen=True)
-class Address:
-    '''Destination used to select the tax region and the freight band.'''
-
-    region: str
-    city: str
-    lines: tuple[str, ...] = ()
+    unit_cents: int
 
 
 @dataclass
 class Order:
-    '''A submitted order. Totals are filled in by the pricing module.'''
+    """A buyer order. clerk_id is blank until shipment is confirmed."""
 
     order_id: str
-    customer_id: str
-    lines: list[LineItem]
-    ship_to: Address
-    status: Status = Status.OPEN
-    subtotal: float = 0.0
-    tax: float = 0.0
-    shipping: float = 0.0
-    total: float = 0.0
-    notes: list[str] = field(default_factory=list)
+    buyer_id: str
+    lines: list[Line] = field(default_factory=list)
+    status: str = OPEN
+    total_cents: int = 0
+    cancel_reason: str = ""
+    clerk_id: str = ""
 
 
-def line_extension(item: LineItem) -> float:
-    '''Pre-tax line extension in dollars.'''
-    return round(item.quantity * item.unit_price_cents / 100.0, 2)
+class OrderError(Exception):
+    """Base error for a refused order operation."""
 
 
-def describe_item(item: LineItem) -> str:
-    '''Short label used on the pick ticket and in the audit note.'''
-    return f'{item.sku} x{item.quantity}'
+class OrderNotFound(OrderError):
+    """No order is stored under the given id."""
+
+
+class OrderStateError(OrderError):
+    """The order status does not allow the operation."""
+
+
+class InventoryError(OrderError):
+    """Stock could not be reserved or returned."""

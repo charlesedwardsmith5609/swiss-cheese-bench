@@ -1,409 +1,435 @@
-diff --git a/hooks/__init__.py b/hooks/__init__.py
-index 767299b..fb3e405 100644
---- a/hooks/__init__.py
-+++ b/hooks/__init__.py
-@@ -1,16 +1,20 @@
--"""Partner webhook receiver."""
-+"""Partner webhook receiver.
-+
-+``accept`` validates a decoded JSON body and records an idempotent receipt.
-+``verify`` checks the HMAC of the raw bytes before the body is decoded.
-+"""
- 
- from hooks.accept import accept
- from hooks.errors import SchemaError, SignatureError, WebhookError
--from hooks.receipts import Receipt, ReceiptLog
-+from hooks.receipts import DeliveryLog, Receipt
- from hooks.sign import verify
- 
- __all__ = [
-+    "DeliveryLog",
-     "Receipt",
--    "ReceiptLog",
-     "SchemaError",
-     "SignatureError",
-     "WebhookError",
-     "accept",
-     "verify",
- ]
-diff --git a/hooks/accept.py b/hooks/accept.py
-index 405dff4..d941ce8 100644
---- a/hooks/accept.py
-+++ b/hooks/accept.py
-@@ -1,26 +1,55 @@
- """Accept a verified webhook body and record a receipt.
- 
- The caller checks the signature before calling ``accept`` and owns the log.
--This module does not keep process-wide state.
-+This module does not keep process-wide state. V1 bodies are flat; v2 bodies
-+carry the resource under ``data.object`` and may include a ``request``.
- """
+diff --git a/tests/test_receiver.py b/tests/test_receiver.py
+index a19c82c..c5e3637 100644
+--- a/tests/test_receiver.py
++++ b/tests/test_receiver.py
+@@ -1,9 +1,9 @@
+-"""Receiver tests for signed build notifications."""
++"""Receiver tests for signed build and deployment notifications."""
  
  from __future__ import annotations
  
- from collections.abc import Mapping
+ import json
  from typing import Any
  
--from hooks.receipts import Receipt, ReceiptLog
--from hooks.schema import V1_SCHEMA
-+from hooks.receipts import DeliveryLog, Receipt
-+from hooks.schema import RESOURCE, V1_SCHEMA, V2_SCHEMA
+ import pytest
+ 
+@@ -45,16 +45,32 @@ def _build(*, delivery_id: str = "del_build_1", **data: Any) -> dict[str, Any]:
+     return {
+         "id": delivery_id,
+         "type": "build.finished",
+         "created": 1_700_000_000,
+         "data": body,
+     }
  
  
--def accept(body: Mapping[str, Any], log: ReceiptLog) -> Receipt:
-+def accept(body: Mapping[str, Any], log: DeliveryLog) -> Receipt:
-     """Validate ``body`` and store a receipt. A repeated id returns the first copy."""
-+    if _is_v2(body):
-+        return _accept_v2(body, log)
-+    return _accept_v1(body, log)
++def _deployment(*, delivery_id: str = "del_deploy_1", **data: Any) -> dict[str, Any]:
++    body: dict[str, Any] = {
++        "environment": "production",
++        "service": "billing",
++        "state": "success",
++        "revision": "9f3c1a2b",
++    }
++    body.update(data)
++    return {
++        "id": delivery_id,
++        "type": "deployment.finished",
++        "created": 1_711_111_111,
++        "data": body,
++    }
 +
 +
-+def _is_v2(body: Mapping[str, Any]) -> bool:
-+    """V2 deliveries are the ones with an envelope id and a data object."""
-+    return isinstance(body, Mapping) and "id" in body and "data" in body
+ def test_accepts_build_finished() -> None:
+     receipt = _accept(_build())
+     assert receipt.delivery_id == "del_build_1"
+     assert receipt.event_type == "build.finished"
+     assert receipt.created == 1_700_000_000
+     assert receipt.repository == "acme/billing"
+     assert receipt.status == "success"
+     assert receipt.revision == "a" * 40
+@@ -106,8 +122,68 @@ def test_rejects_bad_signature() -> None:
+ 
+ 
+ def test_rejects_replay() -> None:
+     ledger = MemoryLedger()
+     payload = _build(delivery_id="del_replay")
+     _accept(payload, ledger)
+     with pytest.raises(ReplayError):
+         _accept(payload, ledger)
 +
 +
-+def _accept_v1(body: Mapping[str, Any], log: DeliveryLog) -> Receipt:
-     parsed = V1_SCHEMA.validate(body)
-     receipt = Receipt(
-         event_id=parsed["event_id"],
-         event_type=parsed["event_type"],
-         customer_id=parsed["customer_id"],
-         amount_cents=parsed["amount_cents"],
-         created=parsed["created"],
-     )
-     return log.put(receipt)
++def test_legacy_target_populates_environment() -> None:
++    payload = _deployment(delivery_id="del_deploy_legacy", state="success")
++    data = payload["data"]
++    assert isinstance(data, dict)
++    del data["environment"]
++    data["target"] = "staging"
++    receipt = _accept(payload)
++    assert receipt.environment == "staging"
++    assert receipt.service == "billing"
++    assert receipt.revision == "9f3c1a2b"
++    assert receipt.attempt == 1
++    assert receipt.status == "success"
 +
 +
-+def _accept_v2(body: Mapping[str, Any], log: DeliveryLog) -> Receipt:
-+    parsed = V2_SCHEMA.validate(body)
-+    resource = RESOURCE.validate(parsed["data"]["object"], reject_unknown=False)
-+    request = parsed["request"]
-+    attempt = 1 if request is None else request["attempt"]
-+    receipt = Receipt(
-+        event_id=parsed["id"],
-+        event_type=parsed["type"],
-+        customer_id=resource["customer"],
-+        amount_cents=resource["amount_cents"],
-+        created=parsed["created"],
-+        api_version=parsed["api_version"],
-+        attempt=attempt,
++@pytest.mark.parametrize("state", ["error", "failed"])
++def test_partner_failure_synonyms(state: str) -> None:
++    receipt = _accept(_deployment(delivery_id=f"del_deploy_{state}", state=state))
++    assert receipt.status == "failure"
++
++
++def test_missing_deployment_state_is_rejected() -> None:
++    payload = _deployment(delivery_id="del_deploy_nostate")
++    data = payload["data"]
++    assert isinstance(data, dict)
++    del data["state"]
++    with pytest.raises(ValidationError):
++        _accept(payload)
++
++
++def test_staging_sample_is_successful_billing_deploy() -> None:
++    receipt = _accept(
++        _deployment(
++            delivery_id="del_stage_44",
++            state="succeeded",
++            environment="production",
++            service="billing",
++            revision="9f3c1a2b",
++        )
 +    )
-+    return log.put(receipt)
-diff --git a/hooks/receipts.py b/hooks/receipts.py
-index 083c45b..169326c 100644
---- a/hooks/receipts.py
-+++ b/hooks/receipts.py
-@@ -1,45 +1,44 @@
- """Idempotent receipt log for accepted webhooks.
++    assert receipt.environment == "production"
++    assert receipt.service == "billing"
++    assert receipt.revision == "9f3c1a2b"
++    assert receipt.status == "success"
++    assert receipt.attempt == 1
++
++
++def test_deployment_rejects_unknown_field() -> None:
++    payload = _deployment(delivery_id="del_deploy_extra", description="rolled out")
++    with pytest.raises(ValidationError):
++        _accept(payload)
++
++
++def test_deployment_replay_is_rejected() -> None:
++    ledger = MemoryLedger()
++    payload = _deployment(delivery_id="del_deploy_replay", state="success")
++    _accept(payload, ledger)
++    with pytest.raises(ReplayError):
++        _accept(payload, ledger)
+diff --git a/webhooks/__init__.py b/webhooks/__init__.py
+index af7928c..f984b96 100644
+--- a/webhooks/__init__.py
++++ b/webhooks/__init__.py
+@@ -1,12 +1,12 @@
+-"""Webhook receiver for build notifications."""
++"""Webhook receiver for build and deployment notifications."""
  
--A ReceiptLog is owned by the caller. It does not spawn threads and it is not
-+A DeliveryLog is owned by the caller. It does not spawn threads and it is not
- safe to share across threads without external locking.
- """
+-from webhooks.errors import ReplayError, SignatureError, ValidationError, WebhookError
+ from webhooks.receiver import MemoryLedger, Receipt, accept_delivery, sign_body
++from webhooks.errors import ReplayError, SignatureError, ValidationError, WebhookError
+ 
+ __all__ = [
+     "MemoryLedger",
+     "Receipt",
+     "ReplayError",
+     "SignatureError",
+     "ValidationError",
+     "WebhookError",
+diff --git a/webhooks/receiver.py b/webhooks/receiver.py
+index cb66d51..9ee3f57 100644
+--- a/webhooks/receiver.py
++++ b/webhooks/receiver.py
+@@ -1,32 +1,35 @@
+-"""Accept signed webhook deliveries once."""
++"""Accept signed build and deployment deliveries once."""
  
  from __future__ import annotations
  
--from dataclasses import dataclass
-+from dataclasses import dataclass, replace
+ import hashlib
+ import hmac
+ from collections.abc import Mapping
+ from dataclasses import dataclass
+ from typing import Any
+ 
+-from webhooks.errors import ReplayError, SignatureError
+ from webhooks.schema import parse_event
++from webhooks.errors import ReplayError, SignatureError
  
  
  @dataclass(frozen=True)
  class Receipt:
--    """One accepted delivery."""
-+    """One accepted delivery.
-+
-+    ``attempt`` is the partner delivery counter. Senders that omit it, including
-+    every v1 body, are stored with attempt 1. ``duplicate`` is set by the log.
-+    """
+     """A delivery that passed signature, schema, and replay checks."""
  
-     event_id: str
+     delivery_id: str
      event_type: str
-     customer_id: str
-     amount_cents: int
      created: int
-+    api_version: str = ""
-+    attempt: int = 1
-     duplicate: bool = False
+     repository: str
+     status: str
+     revision: str
++    environment: str = ""
++    service: str = ""
++    attempt: int | None = None
  
  
--class ReceiptLog:
-+class DeliveryLog:
-     """Remembers event ids so a replay does not apply twice."""
+ class MemoryLedger:
+     """Set of delivery ids accepted so far.
  
-     def __init__(self) -> None:
--        self._by_id: dict[str, Receipt] = {}
-+        self._receipts: dict[str, Receipt] = {}
+     The caller owns the ledger and must not share it across threads.
+     """
  
-     def put(self, receipt: Receipt) -> Receipt:
--        existing = self._by_id.get(receipt.event_id)
-+        existing = self._receipts.get(receipt.event_id)
-         if existing is not None:
--            return Receipt(
--                event_id=existing.event_id,
--                event_type=existing.event_type,
--                customer_id=existing.customer_id,
--                amount_cents=existing.amount_cents,
--                created=existing.created,
--                duplicate=True,
--            )
--        self._by_id[receipt.event_id] = receipt
-+            return replace(existing, duplicate=True)
-+        self._receipts[receipt.event_id] = receipt
-         return receipt
- 
-     def get(self, event_id: str) -> Receipt | None:
--        return self._by_id.get(event_id)
-+        return self._receipts.get(event_id)
-diff --git a/hooks/schema.py b/hooks/schema.py
-index 95db7c0..80e95ca 100644
---- a/hooks/schema.py
-+++ b/hooks/schema.py
-@@ -31,51 +31,94 @@ class Field:
- 
- @dataclass(frozen=True)
- class ObjectSchema:
-     """A JSON object. Unknown keys fail closed when ``reject_unknown`` is set."""
- 
-     fields: tuple[Field, ...]
-     reject_unknown: bool = True
- 
--    def validate(self, payload: Mapping[str, Any]) -> dict[str, Any]:
-+    def validate(
-+        self,
-+        payload: Mapping[str, Any],
-+        *,
-+        reject_unknown: bool | None = None,
-+    ) -> dict[str, Any]:
-         """Return the schema fields read from ``payload``."""
-         if not isinstance(payload, Mapping):
-             raise SchemaError("body must be an object")
-         known = {field.name: field for field in self.fields}
--        if self.reject_unknown:
-+        reject = self.reject_unknown if reject_unknown is None else reject_unknown
-+        if reject:
-             extra = [key for key in payload if key not in known]
-             if extra:
-                 raise SchemaError(f"unknown field {sorted(extra)[0]}")
-         parsed: dict[str, Any] = {}
-         for field in self.fields:
-             parsed[field.name] = _read(field, payload)
-         return parsed
+@@ -44,20 +47,24 @@ class MemoryLedger:
  
  
- def _read(field: Field, payload: Mapping[str, Any]) -> Any:
-     if field.name not in payload:
-         if field.required:
-             raise SchemaError(f"missing {field.name}")
-         return field.default
-     value = payload[field.name]
-+    if isinstance(field.kind, ObjectSchema):
-+        if not isinstance(value, Mapping):
-+            raise SchemaError(f"{field.name} must be an object")
-+        return field.kind.validate(value)
-     if field.kind is int and isinstance(value, bool):
-         raise SchemaError(f"{field.name} must be an integer")
-     if not isinstance(value, field.kind):
-         raise SchemaError(f"{field.name} has the wrong type")
-     if field.choices and value not in field.choices:
-         raise SchemaError(f"{field.name} is not an allowed value")
-     if field.minimum is not None and isinstance(value, int) and value < field.minimum:
-         raise SchemaError(f"{field.name} is below the minimum")
-     return value
+ def sign_body(secret: bytes, body: bytes) -> str:
+     """Return the sha256= signature header for a raw body."""
+     digest = hmac.new(secret, body, hashlib.sha256).hexdigest()
+     return "sha256=" + digest
  
  
--EVENT_TYPES = ("invoice.created", "invoice.voided")
-+EVENT_TYPES = ("invoice.created", "invoice.voided", "invoice.paid", "charge.refunded")
- 
- V1_SCHEMA = ObjectSchema(
-     fields=(
-         Field("event_id", str),
-         Field("event_type", str, choices=EVENT_TYPES),
-         Field("customer_id", str),
-         Field("amount_cents", int, minimum=0),
-         Field("created", int, minimum=0),
-     ),
- )
-+
-+CURRENCIES = ("usd", "eur")
++def _mac_matches(secret: bytes, body: bytes, header: str) -> bool:
++    """Constant-time comparison of the expected signature header."""
++    return hmac.compare_digest(sign_body(secret, body), header)
 +
 +
-+RESOURCE = ObjectSchema(
-+    fields=(
-+        Field("customer", str),
-+        Field("amount_cents", int, minimum=0),
-+        Field("currency", str, choices=CURRENCIES),
-+    ),
-+)
-+
-+REQUEST = ObjectSchema(
-+    fields=(
-+        Field("id", str, required=False, default=""),
-+        Field("attempt", int, minimum=1),
-+    ),
-+)
-+
-+DATA = ObjectSchema(
-+    fields=(Field("object", dict),),
-+)
-+
-+V2_SCHEMA = ObjectSchema(
-+    fields=(
-+        Field("id", str),
-+        Field("type", str, choices=EVENT_TYPES),
-+        Field("created", int, minimum=0),
-+        Field("api_version", str, required=False, default=""),
-+        Field("data", DATA),
-+        Field("request", REQUEST, required=False, default=None),
-+    ),
-+)
-diff --git a/tests/test_accept.py b/tests/test_accept.py
-index 40ec501..6f673da 100644
---- a/tests/test_accept.py
-+++ b/tests/test_accept.py
-@@ -1,59 +1,136 @@
--"""Acceptance tests for flat webhook bodies."""
-+"""Acceptance tests for v1 flat bodies and v2 envelopes."""
+ def verify_signature(secret: bytes, body: bytes, header: str) -> None:
+     """Raise SignatureError when the header does not match the body."""
+-    expected = sign_body(secret, body)
+-    if not hmac.compare_digest(expected, header):
++    if not _mac_matches(secret, body, header):
+         raise SignatureError("signature mismatch")
+ 
+ 
+ def accept_delivery(
+     payload: Mapping[str, Any],
+     *,
+     body: bytes,
+     signature: str,
+@@ -71,12 +78,15 @@ def accept_delivery(
+     """
+     verify_signature(secret, body, signature)
+     parsed = parse_event(payload)
+     ledger.remember(parsed["delivery_id"])
+     return Receipt(
+         delivery_id=parsed["delivery_id"],
+         event_type=parsed["event_type"],
+         created=parsed["created"],
+-        repository=parsed["repository"],
++        repository=parsed.get("repository", ""),
+         status=parsed["status"],
+         revision=parsed["revision"],
++        environment=parsed.get("environment", ""),
++        service=parsed.get("service", ""),
++        attempt=parsed.get("attempt"),
+     )
+diff --git a/webhooks/schema.py b/webhooks/schema.py
+index 26cdb58..40dff26 100644
+--- a/webhooks/schema.py
++++ b/webhooks/schema.py
+@@ -1,30 +1,37 @@
+-"""Schema for inbound build webhooks.
++"""Schema for inbound build and deployment webhooks.
+ 
+-Unknown keys are rejected.
++Unknown keys are rejected. Deployment callbacks accept `target` as `environment`.
+ """
  
  from __future__ import annotations
  
- import pytest
+ from collections.abc import Mapping, Sequence
+ from dataclasses import dataclass
+ from typing import Any
  
--from hooks.receipts import ReceiptLog
--from hooks.errors import SchemaError
- from hooks.accept import accept
-+from hooks.errors import SchemaError
-+from hooks.receipts import DeliveryLog
+ from webhooks.errors import ValidationError
+ 
++_UNSET = object()
++
+ 
+ @dataclass(frozen=True)
+ class Field:
+     """One accepted key on an object."""
+ 
+     name: str
+     kind: str
+     required: bool = True
+     choices: frozenset[str] | None = None
++    aliases: tuple[str, ...] = ()
++    synonyms: tuple[tuple[str, str], ...] = ()
++    default: Any = _UNSET
++    minimum: int | None = None
++    maximum: int | None = None
  
  
- def _body(**overrides: object) -> dict[str, object]:
-     payload: dict[str, object] = {
-         "event_id": "evt_100",
-         "event_type": "invoice.created",
-         "customer_id": "cus_9",
-         "amount_cents": 2500,
-         "created": 1_700_000_000,
+ _ENVELOPE: tuple[Field, ...] = (
+     Field("id", "token"),
+     Field("type", "token"),
+     Field("created", "int"),
+     Field("data", "object"),
+ )
+@@ -34,57 +41,109 @@ _BUILD_FIELDS: tuple[Field, ...] = (
+     Field(
+         "status",
+         "choice",
+         choices=frozenset({"cancelled", "failure", "success"}),
+     ),
+     Field("revision", "sha"),
+ )
+ 
++_DEPLOY_FIELDS: tuple[Field, ...] = (
++    Field("environment", "token", aliases=("target",)),
++    Field("service", "token"),
++    Field(
++        "state",
++        "choice",
++        choices=frozenset({"failure", "success"}),
++        synonyms=(("error", "failure"), ("failed", "failure")),
++        default="success",
++    ),
++    Field("revision", "sha", minimum=7, maximum=40),
++    Field("attempt", "int", required=False, default=1, minimum=1),
++)
++
+ _EVENTS: dict[str, tuple[Field, ...]] = {
+     "build.finished": _BUILD_FIELDS,
++    "deployment.finished": _DEPLOY_FIELDS,
+ }
+ 
+ 
+ def parse_event(payload: Mapping[str, Any]) -> dict[str, Any]:
+     """Validate a webhook body and return the receipt fields."""
+     outer = _bind(payload, _ENVELOPE)
+     kind = outer["type"]
+     fields = _EVENTS.get(kind)
+     if fields is None:
+         raise ValidationError(f"unsupported event: {kind}")
+     data = _bind(outer["data"], fields)
++    if kind == "build.finished":
++        return {
++            "delivery_id": outer["id"],
++            "event_type": kind,
++            "created": outer["created"],
++            "repository": data["repository"],
++            "status": data["status"],
++            "revision": data["revision"],
++        }
+     return {
+         "delivery_id": outer["id"],
+         "event_type": kind,
+         "created": outer["created"],
+-        "repository": data["repository"],
+-        "status": data["status"],
++        "status": data["state"],
+         "revision": data["revision"],
++        "environment": data["environment"],
++        "service": data["service"],
++        "attempt": data["attempt"],
      }
-     payload.update(overrides)
-     return payload
  
  
- def test_accepts_invoice_created() -> None:
--    receipt = accept(_body(), ReceiptLog())
-+    receipt = accept(_body(), DeliveryLog())
-     assert receipt.event_id == "evt_100"
-     assert receipt.amount_cents == 2500
-     assert receipt.duplicate is False
+ def _bind(payload: Mapping[str, Any], fields: Sequence[Field]) -> dict[str, Any]:
+     """Copy declared fields and reject anything else."""
+     if not isinstance(payload, Mapping):
+         raise ValidationError("expected an object")
+-    known = {field.name for field in fields}
++    known = _known_keys(fields)
+     unknown = sorted(set(payload) - known)
+     if unknown:
+         raise ValidationError("unknown fields: " + ", ".join(unknown))
+     bound: dict[str, Any] = {}
+     for field in fields:
+-        if field.name not in payload:
++        raw = _lookup(payload, field)
++        if raw is _UNSET:
+             if field.required:
+                 raise ValidationError(f"{field.name} is required")
+-            continue
+-        bound[field.name] = _coerce(field, payload[field.name])
++            if field.default is _UNSET:
++                continue
++            raw = field.default
++        bound[field.name] = _coerce(field, raw)
+     return bound
  
  
- def test_replay_is_duplicate() -> None:
--    log = ReceiptLog()
-+    log = DeliveryLog()
-     first = accept(_body(), log)
-     second = accept(_body(), log)
-     assert first.duplicate is False
-     assert second.duplicate is True
-     assert second.amount_cents == 2500
- 
- 
- def test_rejects_unknown_field() -> None:
-     with pytest.raises(SchemaError):
--        accept(_body(livemode=True), ReceiptLog())
-+        accept(_body(livemode=True), DeliveryLog())
- 
- 
- def test_rejects_missing_amount() -> None:
-     body = _body()
-     del body["amount_cents"]
-     with pytest.raises(SchemaError):
--        accept(body, ReceiptLog())
-+        accept(body, DeliveryLog())
- 
- 
- def test_rejects_negative_amount() -> None:
-     with pytest.raises(SchemaError):
--        accept(_body(amount_cents=-1), ReceiptLog())
-+        accept(_body(amount_cents=-1), DeliveryLog())
- 
- 
- def test_rejects_unknown_event_type() -> None:
-     with pytest.raises(SchemaError):
--        accept(_body(event_type="customer.deleted"), ReceiptLog())
-+        accept(_body(event_type="customer.deleted"), DeliveryLog())
++def _known_keys(fields: Sequence[Field]) -> set[str]:
++    """Names that may appear on the object, including legacy aliases."""
++    known = {field.name for field in fields}
++    for field in fields:
++        known.update(field.aliases)
++    return known
 +
 +
-+@pytest.mark.parametrize("event_type", ["invoice.paid", "charge.refunded"])
-+def test_v1_accepts_added_event_types(event_type: str) -> None:
-+    receipt = accept(_body(event_type=event_type), DeliveryLog())
-+    assert receipt.event_type == event_type
-+    assert receipt.attempt == 1
++def _lookup(payload: Mapping[str, Any], field: Field) -> Any:
++    """Resolve a field from its canonical name or a legacy alias."""
++    found: list[Any] = []
++    if field.name in payload:
++        found.append(payload[field.name])
++    for alias in field.aliases:
++        if alias in payload:
++            found.append(payload[alias])
++    if not found:
++        return _UNSET
++    if any(item != found[0] for item in found[1:]):
++        raise ValidationError(f"{field.name} conflicts with an alias")
++    return found[0]
 +
 +
-+def _v2(
-+    event_type: str,
-+    resource: dict[str, object],
-+    **extra: object,
-+) -> dict[str, object]:
-+    body: dict[str, object] = {
-+        "id": "evt_200",
-+        "type": event_type,
-+        "created": 1_700_000_100,
-+        "data": {"object": resource},
-+    }
-+    body.update(extra)
-+    return body
-+
-+
-+def test_v2_invoice_paid_records_attempt_and_version() -> None:
-+    resource = {
-+        "customer": "cus_9",
-+        "amount_cents": 2500,
-+        "currency": "usd",
-+        "hosted_invoice_url": "https://pay.example/invoices/evt_200",
-+        "lines": [{"id": "il_1", "amount": 2500}],
-+    }
-+    body = _v2(
-+        "invoice.paid",
-+        resource,
-+        api_version="2024-11-01",
-+        request={"id": "req_9", "attempt": 2},
-+    )
-+    receipt = accept(body, DeliveryLog())
-+    assert receipt.event_id == "evt_200"
-+    assert receipt.customer_id == "cus_9"
-+    assert receipt.amount_cents == 2500
-+    assert receipt.api_version == "2024-11-01"
-+    assert receipt.attempt == 2
-+
-+
-+def test_v2_charge_refunded_defaults_attempt_when_request_absent() -> None:
-+    resource = {
-+        "customer": "cus_3",
-+        "amount_cents": 500,
-+        "currency": "eur",
-+        "balance_transaction": "txn_44",
-+        "reason": "requested_by_customer",
-+    }
-+    receipt = accept(
-+        _v2("charge.refunded", resource, id="evt_201", created=1_700_000_200),
-+        DeliveryLog(),
-+    )
-+    assert receipt.event_type == "charge.refunded"
-+    assert receipt.amount_cents == 500
-+    assert receipt.customer_id == "cus_3"
-+    assert receipt.attempt == 1
-+    assert receipt.api_version == ""
-+
-+
-+def test_v2_rejects_unknown_data_member() -> None:
-+    body = {
-+        "id": "evt_204",
-+        "type": "invoice.paid",
-+        "created": 1_700_000_100,
-+        "data": {
-+            "object": {"customer": "cus_9", "amount_cents": 10, "currency": "usd"},
-+            "previous_attributes": {"amount_cents": 0},
-+        },
-+    }
-+    with pytest.raises(SchemaError):
-+        accept(body, DeliveryLog())
+ def _coerce(field: Field, value: Any) -> Any:
+     """Apply a field kind."""
+     if field.kind == "token":
+         return _coerce_token(field, value)
+     if field.kind == "choice":
+         return _coerce_choice(field, value)
+     if field.kind == "int":
+         return _coerce_int(field, value)
+@@ -104,27 +163,46 @@ def _coerce_token(field: Field, value: Any) -> str:
+ 
+ 
+ def _coerce_choice(field: Field, value: Any) -> str:
+     """Normalize a choice field to its canonical value."""
+     if not isinstance(value, str) or not value.strip():
+         raise ValidationError(f"{field.name} must be a non-empty string")
+     token = value.strip().lower()
+     allowed = field.choices or frozenset()
+-    if token not in allowed:
+-        listed = ", ".join(sorted(allowed))
+-        raise ValidationError(f"{field.name} must be one of {listed}")
+-    return token
++    if token in allowed:
++        return token
++    translated = dict(field.synonyms).get(token)
++    if translated is not None:
++        if translated not in allowed:
++            raise ValidationError(f"{field.name} synonym is not allowed")
++        return translated
++    if field.default is not _UNSET:
++        return str(field.default)
++    listed = ", ".join(sorted(allowed))
++    raise ValidationError(f"{field.name} must be one of {listed}")
+ 
+ 
+ def _coerce_int(field: Field, value: Any) -> int:
+     if isinstance(value, bool) or not isinstance(value, int):
+         raise ValidationError(f"{field.name} must be an integer")
++    if field.minimum is not None and value < field.minimum:
++        raise ValidationError(f"{field.name} must be >= {field.minimum}")
++    if field.maximum is not None and value > field.maximum:
++        raise ValidationError(f"{field.name} must be <= {field.maximum}")
+     return value
+ 
+ 
+ def _coerce_sha(field: Field, value: Any) -> str:
+     if not isinstance(value, str):
+         raise ValidationError(f"{field.name} must be a hex sha")
+     token = value.strip().lower()
+-    if len(token) != 40 or any(char not in "0123456789abcdef" for char in token):
+-        raise ValidationError(f"{field.name} must be a 40-character hex sha")
++    low = 40 if field.minimum is None else field.minimum
++    high = 40 if field.maximum is None else field.maximum
++    bad_width = len(token) < low or len(token) > high
++    bad_digit = any(char not in "0123456789abcdef" for char in token)
++    if bad_width or bad_digit:
++        if low == 40 and high == 40:
++            raise ValidationError(f"{field.name} must be a 40-character hex sha")
++        raise ValidationError(
++            f"{field.name} must be a hex sha of {low} to {high} characters"
++        )
+     return token

@@ -1,9 +1,9 @@
 {
   "category": "unrelated_deletion",
   "tier": "hard",
-  "file": "auth/store.go",
-  "description": "EndDevice no longer rejects a negative device index, so -1 panics on the session slice instead of returning ErrNotFound.",
-  "evidence": "index < 0",
+  "file": "auth/service.go",
+  "description": "Refresh no longer drops the retired session from the hot cache when that critical section moves into Directory.Replace, so a later lookup by the old id still hits the cached record.",
+  "evidence": "s.dir.hot.drop(cur.ID)",
   "author": "grok-4.7-medium-fast",
-  "why_hard": "The list check still rejects an index past the last device, so dropping the negative bound reads as a reflow beside the idle and absolute deadline edits in EndDevice."
+  "why_hard": "Replace and storeLocked still delete the old map entry and cache the successor, and the refresh test only asserts that the authoritative index no longer has the previous id, so the lost hot-cache drop reads as the locked block being folded into those helpers beside the client-id and TouchedAt edits."
 }

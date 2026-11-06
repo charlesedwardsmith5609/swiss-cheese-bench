@@ -1,9 +1,9 @@
 {
   "category": "validation_disabled",
   "tier": "hard",
-  "file": "hooks/accept.py",
-  "description": "The v2 path validates the resource with unknown-field rejection forced off, so keys the resource schema does not define are accepted.",
-  "evidence": "reject_unknown=False",
+  "file": "webhooks/schema.py",
+  "description": "Unrecognized deployment states fall through to the success default, so a token outside the allow-list is stored as successful.",
+  "evidence": "return str(field.default)",
   "author": "grok-4.7-medium-fast",
-  "why_hard": "The resource schema still defaults unknown-field rejection on, and a v2 test still rejects an unknown sibling of data.object, but the mapper calls RESOURCE.validate with reject_unknown=False, which is what admits hosted_invoice_url and lines."
+  "why_hard": "Missing deployment state still raises, unknown keys are still rejected, and error/failed still map to failure, so the success default on a required choice looks unused until the unrecognized-token branch is read."
 }

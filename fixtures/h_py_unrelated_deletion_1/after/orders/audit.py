@@ -1,31 +1,44 @@
-'''Append-only desk audit. The service is the only writer.'''
+"""Append-only decisions for orders.
+
+The OrderService is the only writer. Readers copy events out; nobody
+rewrites an event after record() returns. clerk_id is set when a person
+confirmed shipment; other events leave it blank.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
-@dataclass(frozen=True)
-class AuditEntry:
-    '''A single desk action. requested_by is the actor string the desk was given.'''
-
-    action: str
+@dataclass
+class Event:
+    kind: str
     order_id: str
-    requested_by: str
+    detail: dict[str, object] = field(default_factory=dict)
+    clerk_id: str = ""
 
 
 class AuditLog:
-    '''In-memory audit trail. Callers append; readers only filter.'''
+    """In-memory log of place, fulfill, and cancel decisions."""
 
     def __init__(self) -> None:
-        self._entries: list[AuditEntry] = []
+        self._events: list[Event] = []
 
-    def record(self, action: str, order_id: str, requested_by: str) -> AuditEntry:
-        '''Append an action attributed to requested_by.'''
-        entry = AuditEntry(action=action, order_id=order_id, requested_by=requested_by)
-        self._entries.append(entry)
-        return entry
+    def record(
+        self,
+        kind: str,
+        order_id: str,
+        clerk_id: str = "",
+        **detail: object,
+    ) -> Event:
+        event = Event(
+            kind=kind,
+            order_id=order_id,
+            detail=dict(detail),
+            clerk_id=clerk_id,
+        )
+        self._events.append(event)
+        return event
 
-    def for_order(self, order_id: str) -> list[AuditEntry]:
-        '''Entries for one order, oldest first.'''
-        return [entry for entry in self._entries if entry.order_id == order_id]
+    def for_order(self, order_id: str) -> list[Event]:
+        return [event for event in self._events if event.order_id == order_id]

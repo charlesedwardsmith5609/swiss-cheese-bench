@@ -1,587 +1,510 @@
-diff --git a/auth/audit.go b/auth/audit.go
-index f8b026d..aaea946 100644
---- a/auth/audit.go
-+++ b/auth/audit.go
-@@ -1,41 +1,42 @@
- package auth
- 
- import "time"
- 
- // Entry is one recorded authentication action.
- type Entry struct {
--	Action string
--	UserID string
--	Actor  string
--	At     time.Time
-+	Action      string
-+	UserID      string
-+	RequestedBy string
-+	At          time.Time
- }
- 
- // Log stores authentication actions in memory, oldest first.
- //
--// The handler writes the log on the request goroutine. Log has no mutex;
--// callers serialize access themselves.
-+// RequestedBy is the actor the caller supplied. The handler writes the log
-+// on the request goroutine. Log has no mutex; callers serialize access
-+// themselves.
- type Log struct {
- 	now     func() time.Time
- 	entries []Entry
- }
- 
- // NewLog returns a log stamped with time.Now.
- func NewLog() *Log {
- 	return &Log{now: time.Now}
- }
- 
--// Record appends an action performed by actor.
--func (l *Log) Record(action, userID, actor string) Entry {
-+// Record appends an action attributed to requestedBy.
-+func (l *Log) Record(action, userID, requestedBy string) Entry {
- 	entry := Entry{
--		Action: action,
--		UserID: userID,
--		Actor:  actor,
--		At:     l.clock(),
-+		Action:      action,
-+		UserID:      userID,
-+		RequestedBy: requestedBy,
-+		At:          l.clock(),
- 	}
- 	l.entries = append(l.entries, entry)
- 	return entry
- }
- 
- // ForUser returns the entries for userID in the order they were recorded.
- func (l *Log) ForUser(userID string) []Entry {
- 	out := make([]Entry, 0)
 diff --git a/auth/directory.go b/auth/directory.go
-index 54aaa85..2ae5586 100644
+index 4083370..18553e7 100644
 --- a/auth/directory.go
 +++ b/auth/directory.go
-@@ -49,17 +49,17 @@ func NewDirectory() *Directory {
- 	return &Directory{
- 		byEmail:  make(map[string]*User),
- 		failures: make(map[string]int),
- 		locked:   make(map[string]time.Time),
- 		now:      time.Now,
- 	}
- }
- 
--// Add registers an account. The password is stored as an HMAC under a random salt.
-+// Add registers an account. The password is stored as a keyed MAC under a random salt.
- func (d *Directory) Add(email, password string) (*User, error) {
- 	if email == "" || password == "" || len(password) > maxPasswordLen {
- 		return nil, errors.New("auth: invalid user")
- 	}
- 	d.mu.Lock()
- 	defer d.mu.Unlock()
- 	if _, exists := d.byEmail[email]; exists {
- 		return nil, errors.New("auth: user exists")
-@@ -67,31 +67,33 @@ func (d *Directory) Add(email, password string) (*User, error) {
- 	idBuf := make([]byte, 16)
- 	if _, err := rand.Read(idBuf); err != nil {
- 		return nil, err
- 	}
- 	salt := make([]byte, 16)
- 	if _, err := rand.Read(salt); err != nil {
- 		return nil, err
- 	}
--	sum, err := mix(salt, password)
-+	sum, err := passwordMAC(salt, password)
- 	if err != nil {
- 		return nil, err
- 	}
- 	user := &User{
- 		ID:           hex.EncodeToString(idBuf),
- 		Email:        email,
- 		passwordHash: sum,
- 		salt:         salt,
- 	}
- 	d.byEmail[email] = user
- 	return user, nil
- }
- 
- // Authenticate checks the password and applies the failed-login lockout.
-+// The email and password are required, and a password longer than
-+// maxPasswordLen is rejected before the directory lock is taken.
- // A matching password clears the failure counter and any open lockout.
- func (d *Directory) Authenticate(ctx context.Context, email, password string) (*User, error) {
- 	if err := ctx.Err(); err != nil {
- 		return nil, err
- 	}
- 	if email == "" || password == "" || len(password) > maxPasswordLen {
- 		return nil, ErrBadCredentials
- 	}
-@@ -99,17 +101,17 @@ func (d *Directory) Authenticate(ctx context.Context, email, password string) (*
- 	defer d.mu.Unlock()
- 	user, ok := d.byEmail[email]
- 	if !ok {
- 		return nil, ErrBadCredentials
- 	}
- 	if until, locked := d.locked[email]; locked && d.clock().Before(until) {
- 		return nil, ErrLocked
- 	}
--	got, err := mix(user.salt, password)
-+	got, err := passwordMAC(user.salt, password)
- 	if err != nil {
- 		return nil, err
- 	}
- 	if subtle.ConstantTimeCompare(got, user.passwordHash) != 1 {
- 		d.failures[email]++
- 		if d.failures[email] >= lockoutAfter {
- 			d.locked[email] = d.clock().Add(lockoutFor)
- 		}
-@@ -122,15 +124,15 @@ func (d *Directory) Authenticate(ctx context.Context, email, password string) (*
- 
- func (d *Directory) clock() time.Time {
- 	if d.now == nil {
- 		return time.Now()
- 	}
- 	return d.now()
- }
- 
--func mix(salt []byte, password string) ([]byte, error) {
-+func passwordMAC(salt []byte, password string) ([]byte, error) {
- 	mac := hmac.New(sha256.New, salt)
- 	if _, err := mac.Write([]byte(password)); err != nil {
- 		return nil, err
- 	}
- 	return mac.Sum(nil), nil
- }
-diff --git a/auth/handler.go b/auth/handler.go
-index c9c7fdd..f9f59e4 100644
---- a/auth/handler.go
-+++ b/auth/handler.go
-@@ -1,15 +1,16 @@
- package auth
+@@ -2,19 +2,19 @@ package auth
  
  import (
- 	"context"
- 	"encoding/json"
- 	"net/http"
- 	"strconv"
-+	"strings"
- )
- 
- const sessionCookie = "sid"
- 
- type ctxKey int
- 
- const userKey ctxKey = iota
- 
-@@ -17,21 +18,23 @@ const userKey ctxKey = iota
- type Handler struct {
- 	Dir    *Directory
- 	Store  *Store
- 	Log    *Log
- 	Tokens *TokenCodec
- }
- 
- type loginBody struct {
--	Email    string `json:"email"`
--	Password string `json:"password"`
-+	Email       string `json:"email"`
-+	Password    string `json:"password"`
-+	RequestedBy string `json:"requested_by"`
- }
- 
- // Login checks the password, opens a session, and sets the sid cookie.
-+// The cookie Expires at the session's absolute expiry.
- func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
- 	if r.Method != http.MethodPost {
- 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
- 		return
- 	}
- 	var body loginBody
- 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
- 		http.Error(w, "bad request", http.StatusBadRequest)
-@@ -47,30 +50,23 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
- 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
- 		return
- 	}
- 	raw, err := h.Tokens.Seal(sess.ID)
- 	if err != nil {
- 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
- 		return
- 	}
--	http.SetCookie(w, &http.Cookie{
--		Name:     sessionCookie,
--		Value:    raw,
--		Path:     "/",
--		HttpOnly: true,
--		Secure:   true,
--		SameSite: http.SameSiteLaxMode,
--		Expires:  sess.ExpiresAt,
--	})
--	h.Log.Record("login", user.ID, user.ID)
-+	setSessionCookie(w, sess, raw)
-+	h.Log.Record("login", user.ID, requestedBy(r, body.RequestedBy, user.ID))
- 	if err := writeJSON(w, http.StatusOK, map[string]any{
--		"user_id":    user.ID,
--		"session_id": sess.ID,
--		"expires_at": sess.ExpiresAt,
-+		"user_id":         user.ID,
-+		"session_id":      sess.ID,
-+		"idle_deadline":   sess.IdleDeadline,
-+		"absolute_expiry": sess.AbsoluteExpiry,
- 	}); err != nil {
- 		return
- 	}
- }
- 
- // Logout revokes the session carried by the sid cookie.
- func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
- 	if r.Method != http.MethodPost {
-@@ -82,38 +78,40 @@ func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
- 		http.Error(w, "unauthorized", http.StatusUnauthorized)
- 		return
- 	}
- 	if err := h.Store.Revoke(sess.ID); err != nil {
- 		http.Error(w, "unauthorized", http.StatusUnauthorized)
- 		return
- 	}
- 	clearCookie(w)
--	h.Log.Record("logout", sess.UserID, sess.UserID)
-+	h.Log.Record("logout", sess.UserID, requestedBy(r, "", sess.UserID))
- 	w.WriteHeader(http.StatusNoContent)
- }
- 
- // Require slides the idle deadline and rejects missing or expired sessions.
-+// The cookie Expires is rewritten to the same absolute expiry.
- func (h *Handler) Require(next http.Handler) http.Handler {
- 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
- 		cookie, err := r.Cookie(sessionCookie)
- 		if err != nil {
- 			http.Error(w, "unauthorized", http.StatusUnauthorized)
- 			return
- 		}
- 		id, err := h.Tokens.Open(cookie.Value)
- 		if err != nil {
- 			http.Error(w, "unauthorized", http.StatusUnauthorized)
- 			return
- 		}
--		sess, err := h.Store.Touch(id)
-+		sess, err := h.Store.Slide(id)
- 		if err != nil {
- 			http.Error(w, "unauthorized", http.StatusUnauthorized)
- 			return
- 		}
-+		setSessionCookie(w, sess, cookie.Value)
- 		ctx := context.WithValue(r.Context(), userKey, sess.UserID)
- 		next.ServeHTTP(w, r.WithContext(ctx))
- 	})
- }
- 
- // Me returns the snapshot for the sid cookie without sliding the deadline.
- func (h *Handler) Me(w http.ResponseWriter, r *http.Request) {
- 	sess, err := h.sessionFromRequest(r)
-@@ -156,16 +154,38 @@ func (h *Handler) sessionFromRequest(r *http.Request) (*Session, error) {
- 	}
- 	id, err := h.Tokens.Open(cookie.Value)
- 	if err != nil {
- 		return nil, err
- 	}
- 	return h.Store.Get(id)
- }
- 
-+func setSessionCookie(w http.ResponseWriter, sess *Session, raw string) {
-+	http.SetCookie(w, &http.Cookie{
-+		Name:     sessionCookie,
-+		Value:    raw,
-+		Path:     "/",
-+		HttpOnly: true,
-+		Secure:   true,
-+		SameSite: http.SameSiteLaxMode,
-+		Expires:  sess.AbsoluteExpiry,
-+	})
-+}
-+
-+func requestedBy(r *http.Request, fromBody, userID string) string {
-+	if v := strings.TrimSpace(fromBody); v != "" {
-+		return v
-+	}
-+	if v := strings.TrimSpace(r.Header.Get("X-Requested-By")); v != "" {
-+		return v
-+	}
-+	return userID
-+}
-+
- func writeJSON(w http.ResponseWriter, status int, body any) error {
- 	w.Header().Set("Content-Type", "application/json")
- 	w.WriteHeader(status)
- 	return json.NewEncoder(w).Encode(body)
- }
- 
- func clearCookie(w http.ResponseWriter) {
- 	http.SetCookie(w, &http.Cookie{
-diff --git a/auth/store.go b/auth/store.go
-index 5251799..e5150f8 100644
---- a/auth/store.go
-+++ b/auth/store.go
-@@ -10,53 +10,59 @@ import (
- 
- const (
- 	idBytes     = 16
- 	maxSessions = 10000
- 	maxDevices  = 8
- )
- 
- // ErrNotFound means the id is not in the store.
--// ErrExpired means the idle deadline has passed.
-+// ErrExpired means the idle deadline or the absolute expiry has passed.
- // ErrStoreFull and ErrTooMany bound how many sessions are retained.
- var (
- 	ErrNotFound  = errors.New("auth: session not found")
- 	ErrExpired   = errors.New("auth: session expired")
- 	ErrStoreFull = errors.New("auth: session store is full")
- 	ErrTooMany   = errors.New("auth: too many sessions for user")
- )
- 
--// Session is one signed-in device. ExpiresAt is the idle deadline.
-+// Session is one signed-in device.
-+// IdleDeadline slides forward; AbsoluteExpiry does not.
- type Session struct {
--	ID        string
--	UserID    string
--	ExpiresAt time.Time
--	IssuedAt  time.Time
-+	ID             string
-+	UserID         string
-+	IdleDeadline   time.Time
-+	AbsoluteExpiry time.Time
-+	IssuedAt       time.Time
- }
- 
- // Store is an in-memory session table. Store owns its mutex.
- type Store struct {
- 	mu       sync.Mutex
- 	sessions map[string]*Session
- 	byUser   map[string][]string
- 	now      func() time.Time
- 	idle     time.Duration
-+	absolute time.Duration
- }
- 
--// NewStore returns a store whose sessions go idle after idle.
--func NewStore(idle time.Duration) *Store {
-+// NewStore returns a store with the given idle and absolute lifetimes.
-+func NewStore(idle, absolute time.Duration) *Store {
- 	return &Store{
- 		sessions: make(map[string]*Session),
- 		byUser:   make(map[string][]string),
- 		now:      time.Now,
- 		idle:     idle,
-+		absolute: absolute,
- 	}
- }
- 
- // Issue opens a session for userID and appends it to that user's device list.
-+// The idle deadline is now plus the idle lifetime. The absolute expiry is
-+// now plus the absolute lifetime and is not moved by Slide.
- func (s *Store) Issue(userID string) (*Session, error) {
- 	if userID == "" {
- 		return nil, errors.New("auth: empty user id")
- 	}
- 	s.mu.Lock()
- 	defer s.mu.Unlock()
- 	if len(s.sessions) >= maxSessions {
- 		return nil, ErrStoreFull
-@@ -66,46 +72,48 @@ func (s *Store) Issue(userID string) (*Session, error) {
- 		return nil, ErrTooMany
- 	}
- 	id, err := newSessionID()
- 	if err != nil {
- 		return nil, err
- 	}
- 	now := s.clock()
- 	sess := &Session{
--		ID:        id,
--		UserID:    userID,
--		ExpiresAt: now.Add(s.idle),
--		IssuedAt:  now,
-+		ID:             id,
-+		UserID:         userID,
-+		IdleDeadline:   now.Add(s.idle),
-+		AbsoluteExpiry: now.Add(s.absolute),
-+		IssuedAt:       now,
- 	}
- 	s.sessions[id] = sess
- 	s.byUser[userID] = append(list, id)
- 	return cloneSession(sess), nil
- }
- 
--// Get returns a live session. An expired session is removed.
-+// Get returns a live session. A session past either deadline is removed.
- func (s *Store) Get(id string) (*Session, error) {
- 	s.mu.Lock()
- 	defer s.mu.Unlock()
- 	sess, err := s.liveLocked(id)
- 	if err != nil {
- 		return nil, err
- 	}
- 	return cloneSession(sess), nil
- }
- 
--// Touch extends the idle deadline of a live session.
--func (s *Store) Touch(id string) (*Session, error) {
-+// Slide extends the idle deadline of a live session.
-+// AbsoluteExpiry stays at the instant recorded by Issue.
-+func (s *Store) Slide(id string) (*Session, error) {
- 	s.mu.Lock()
- 	defer s.mu.Unlock()
- 	sess, err := s.liveLocked(id)
- 	if err != nil {
- 		return nil, err
- 	}
--	sess.ExpiresAt = s.clock().Add(s.idle)
-+	sess.IdleDeadline = s.clock().Add(s.idle)
- 	return cloneSession(sess), nil
- }
- 
- // Revoke deletes the session and its device-list entry.
- func (s *Store) Revoke(id string) error {
- 	s.mu.Lock()
- 	defer s.mu.Unlock()
- 	sess, ok := s.sessions[id]
-@@ -113,29 +121,30 @@ func (s *Store) Revoke(id string) error {
- 		return ErrNotFound
- 	}
- 	s.dropLocked(sess)
- 	return nil
- }
- 
- // EndDevice revokes the session at index in the user's device list.
- // Index zero is the oldest session still on file for that user.
--// An expired session is dropped and reported as ErrExpired.
-+// A session past either deadline is dropped and reported as ErrExpired.
- func (s *Store) EndDevice(userID string, index int) error {
- 	s.mu.Lock()
- 	defer s.mu.Unlock()
- 	list := s.byUser[userID]
--	if index < 0 || index >= len(list) {
-+	if index >= len(list) {
- 		return ErrNotFound
- 	}
- 	sess, ok := s.sessions[list[index]]
- 	if !ok {
- 		return ErrNotFound
- 	}
--	if s.clock().After(sess.ExpiresAt) {
-+	now := s.clock()
-+	if now.After(sess.IdleDeadline) || now.After(sess.AbsoluteExpiry) {
- 		s.dropLocked(sess)
- 		return ErrExpired
- 	}
- 	s.dropLocked(sess)
- 	return nil
- }
- 
- // Devices returns the user's sessions, oldest first.
-@@ -154,17 +163,18 @@ func (s *Store) Devices(userID string) []*Session {
- 	return out
- }
- 
- func (s *Store) liveLocked(id string) (*Session, error) {
- 	sess, ok := s.sessions[id]
- 	if !ok {
- 		return nil, ErrNotFound
- 	}
--	if s.clock().After(sess.ExpiresAt) {
-+	now := s.clock()
-+	if now.After(sess.IdleDeadline) || now.After(sess.AbsoluteExpiry) {
- 		s.dropLocked(sess)
- 		return nil, ErrExpired
- 	}
- 	return sess, nil
- }
- 
- func (s *Store) dropLocked(sess *Session) {
- 	delete(s.sessions, sess.ID)
-diff --git a/auth/token.go b/auth/token.go
-index 12b2682..34bf0f2 100644
---- a/auth/token.go
-+++ b/auth/token.go
-@@ -8,64 +8,67 @@ import (
- 	"strings"
+ 	"sync"
  	"time"
  )
  
- // ErrToken is returned when a session cookie fails to verify.
- var ErrToken = errors.New("auth: bad session token")
- 
- // Snapshot is the session view handlers return to clients.
-+// IdleDeadline slides; AbsoluteExpiry is fixed at issue time.
- type Snapshot struct {
--	ID        string    `json:"id"`
--	UserID    string    `json:"user_id"`
--	ExpiresAt time.Time `json:"expires_at"`
--	IssuedAt  time.Time `json:"issued_at"`
-+	ID             string    `json:"id"`
-+	UserID         string    `json:"user_id"`
-+	IdleDeadline   time.Time `json:"idle_deadline"`
-+	AbsoluteExpiry time.Time `json:"absolute_expiry"`
-+	IssuedAt       time.Time `json:"issued_at"`
+ // Directory is the process-local session index.
+ //
+-// mu guards sessions and hot. Callers in this package may lock mu only when
+-// they do not already hold it. The service goroutine for a request is the
+-// usual caller; the mutex exists so one Directory can be shared.
++// mu guards sessions and hot. Each exported method locks mu for a single
++// map update or lookup and releases it before returning. Callers outside
++// Directory must not lock mu themselves.
+ type Directory struct {
+ 	mu       sync.Mutex
+ 	sessions map[string]Session
+ 	hot      *cache
  }
  
- // SnapshotOf copies the exported session fields.
- func SnapshotOf(sess *Session) Snapshot {
- 	return Snapshot{
--		ID:        sess.ID,
--		UserID:    sess.UserID,
--		ExpiresAt: sess.ExpiresAt,
--		IssuedAt:  sess.IssuedAt,
-+		ID:             sess.ID,
-+		UserID:         sess.UserID,
-+		IdleDeadline:   sess.IdleDeadline,
-+		AbsoluteExpiry: sess.AbsoluteExpiry,
-+		IssuedAt:       sess.IssuedAt,
+ // NewDirectory returns an empty index.
+ func NewDirectory() *Directory {
+@@ -23,20 +23,33 @@ func NewDirectory() *Directory {
+ 		hot:      newCache(),
  	}
  }
  
--// TokenCodec seals a session id with HMAC-SHA256.
-+// TokenCodec seals a session id with HMAC-SHA256. The key is copied at construction.
- type TokenCodec struct {
- 	secret []byte
+ // Put inserts or replaces s in the index and the hot cache.
+ func (d *Directory) Put(s Session) {
+ 	d.mu.Lock()
+ 	defer d.mu.Unlock()
++	d.storeLocked(s)
++}
++
++// storeLocked writes s into the index and the hot cache. The caller holds mu.
++func (d *Directory) storeLocked(s Session) {
+ 	d.sessions[s.ID] = s
+ 	d.hot.put(s)
  }
  
- // NewTokenCodec copies secret so a later edit by the caller cannot change the key.
- func NewTokenCodec(secret []byte) *TokenCodec {
- 	cp := make([]byte, len(secret))
- 	copy(cp, secret)
- 	return &TokenCodec{secret: cp}
++// Replace deletes prevID from the session map and stores next under one lock.
++func (d *Directory) Replace(prevID string, next Session) {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	delete(d.sessions, prevID)
++	d.storeLocked(next)
++}
++
+ // Get returns the session for id when it exists and now is strictly before
+ // expiry. A hot-cache hit is preferred so repeated authentications do not
+ // walk the map.
+ func (d *Directory) Get(id string, now time.Time) (Session, error) {
+ 	d.mu.Lock()
+ 	defer d.mu.Unlock()
+ 	if s, ok := d.hot.get(id); ok {
+ 		return checkFresh(s, now)
+diff --git a/auth/model.go b/auth/model.go
+index 360a71f..4930cb6 100644
+--- a/auth/model.go
++++ b/auth/model.go
+@@ -1,40 +1,44 @@
+ // Package auth issues and checks process-local login sessions.
+ //
+ // A Service stores Session values in a Directory and appends Event values to
+-// a Log. The raw bearer token is returned to the caller once and is not
+-// written to the Directory.
++// a Log. Login records the OAuth client id. Refresh keeps that client and
++// the user, and mints a new session id, bearer token, and absolute expiry.
++// Both paths stamp TouchedAt from the caller-supplied clock. The raw bearer
++// token is returned once and is not written to the Directory.
+ package auth
+ 
+ import (
+ 	"errors"
+ 	"time"
+ )
+ 
+ var (
+ 	// ErrNotFound means the session id is not in the index.
+ 	ErrNotFound = errors.New("auth: session not found")
+ 
+ 	// ErrExpired means now is at or past the session's absolute expiry.
+ 	ErrExpired = errors.New("auth: session expired")
+ 
+-	// ErrCredentials means the user id or the bearer token was rejected.
++	// ErrCredentials means the user id, client id, or bearer token was rejected.
+ 	ErrCredentials = errors.New("auth: credentials rejected")
+ )
+ 
+ // Session is the server-side record of one authenticated login.
+ // The bearer token is not retained. TokenHash is a hex-encoded SHA-256 of it.
+-// LastSeen is the caller-supplied clock at issue or refresh.
++// ClientID is the OAuth client that started the login. TouchedAt is the
++// caller-supplied clock at mint time, for both login and refresh.
+ type Session struct {
+ 	ID        string
+ 	UserID    string
++	ClientID  string
+ 	TokenHash string
+ 	ExpiresAt time.Time
+-	LastSeen  time.Time
++	TouchedAt time.Time
  }
  
--// Seal returns the session id and a hex HMAC, separated by a dot.
-+// Seal returns the session id and its hex HMAC, separated by a dot.
- func (c *TokenCodec) Seal(id string) (string, error) {
- 	if id == "" {
- 		return "", ErrToken
- 	}
- 	mac := hmac.New(sha256.New, c.secret)
- 	if _, err := mac.Write([]byte(id)); err != nil {
- 		return "", err
- 	}
- 	return id + "." + hex.EncodeToString(mac.Sum(nil)), nil
+ // Principal is the identity a handler receives after Authenticate succeeds.
+ type Principal struct {
+ 	UserID    string
+ 	SessionID string
  }
  
- // Open checks the HMAC and returns the session id.
- func (c *TokenCodec) Open(raw string) (string, error) {
--	id, sig, ok := strings.Cut(raw, ".")
--	if !ok || id == "" || sig == "" {
-+	id, macHex, ok := strings.Cut(raw, ".")
-+	if !ok || id == "" || macHex == "" {
- 		return "", ErrToken
+diff --git a/auth/service.go b/auth/service.go
+index 13bd245..4f85fbd 100644
+--- a/auth/service.go
++++ b/auth/service.go
+@@ -1,25 +1,18 @@
+ package auth
+ 
+-import (
+-	"crypto/rand"
+-	"crypto/sha256"
+-	"encoding/hex"
+-	"fmt"
+-	"time"
+-)
++import "time"
+ 
+-const (
+-	tokenBytes = 32
+-	lifetime   = 12 * time.Hour
+-)
++const absoluteTTL = 12 * time.Hour
+ 
+ // Log retains authentication events in memory, in call order.
+-// The Service calls Log on the request goroutine. A nil Log discards events.
++// Login writes session.login, Refresh writes session.refresh, and Logout
++// writes session.logout. The Service calls Log on the request goroutine.
++// A nil Log discards events.
+ type Log struct {
+ 	events []Event
+ }
+ 
+ // NewLog returns an empty log.
+ func NewLog() *Log {
+ 	return &Log{}
+ }
+@@ -52,108 +45,80 @@ type Service struct {
+ 	log *Log
+ }
+ 
+ // NewService returns a service that stores sessions in dir and events in log.
+ func NewService(dir *Directory, log *Log) *Service {
+ 	return &Service{dir: dir, log: log}
+ }
+ 
+-// Login issues a session for userID. now is the caller's clock, used for
+-// expiry and LastSeen so tests can freeze time.
+-func (s *Service) Login(userID string, now time.Time) (Session, string, error) {
+-	if userID == "" {
++// Login issues a session for userID on behalf of clientID. now is the
++// caller's clock and is stored as TouchedAt. Expiry is now plus absoluteTTL.
++func (s *Service) Login(userID, clientID string, now time.Time) (Session, string, error) {
++	if userID == "" || clientID == "" {
+ 		return Session{}, "", ErrCredentials
  	}
--	want, err := hex.DecodeString(sig)
-+	want, err := hex.DecodeString(macHex)
+-	sess, raw, err := s.issue(userID, now)
++	sess, raw, err := s.mint(userID, clientID, now)
  	if err != nil {
- 		return "", ErrToken
+ 		return Session{}, "", err
  	}
- 	mac := hmac.New(sha256.New, c.secret)
- 	if _, err := mac.Write([]byte(id)); err != nil {
- 		return "", err
+ 	s.dir.Put(sess)
+ 	s.log.Record("session.login", userID, sess.ID)
+ 	return sess, raw, nil
+ }
+ 
+-// Refresh exchanges a live session for a new id, token, and expiry. The user
+-// is unchanged. The previous record is removed before the successor is stored.
++// Refresh mints a new id, bearer token, and absolute expiry. The user id and
++// client id are copied from the current session. now becomes TouchedAt.
+ func (s *Service) Refresh(id, token string, now time.Time) (Session, string, error) {
+ 	cur, err := s.dir.Get(id, now)
+ 	if err != nil {
+ 		return Session{}, "", err
  	}
- 	if !hmac.Equal(mac.Sum(nil), want) {
+-	if cur.TokenHash != hashToken(token) {
++	if cur.TokenHash != digestBearer(token) {
+ 		return Session{}, "", ErrCredentials
+ 	}
+-	fresh, raw, err := s.issue(cur.UserID, now)
++	fresh, raw, err := s.mint(cur.UserID, cur.ClientID, now)
+ 	if err != nil {
+ 		return Session{}, "", err
+ 	}
+-	s.dir.mu.Lock()
+-	delete(s.dir.sessions, cur.ID)
+-	s.dir.hot.drop(cur.ID)
+-	s.dir.sessions[fresh.ID] = fresh
+-	s.dir.hot.put(fresh)
+-	s.dir.mu.Unlock()
++	s.dir.Replace(cur.ID, fresh)
+ 	s.log.Record("session.refresh", cur.UserID, fresh.ID)
+ 	return fresh, raw, nil
+ }
+ 
+ // Logout retires id if it is present. A second logout is a no-op.
+ func (s *Service) Logout(id string) {
+ 	s.dir.Retire(id)
+ 	s.log.Record("session.logout", "", id)
+ }
+ 
+-// Authenticate checks the bearer token against the stored hash and expiry.
++// Authenticate checks the bearer token against the stored digest and expiry.
+ func (s *Service) Authenticate(id, token string, now time.Time) (Principal, error) {
+ 	cur, err := s.dir.Get(id, now)
+ 	if err != nil {
+ 		return Principal{}, err
+ 	}
+-	if cur.TokenHash != hashToken(token) {
++	if cur.TokenHash != digestBearer(token) {
+ 		return Principal{}, ErrCredentials
+ 	}
+ 	return Principal{UserID: cur.UserID, SessionID: cur.ID}, nil
+ }
+ 
+-// issue builds an unstored session and the raw bearer token.
+-func (s *Service) issue(userID string, now time.Time) (Session, string, error) {
++// mint builds an unstored session and the raw bearer token.
++func (s *Service) mint(userID, clientID string, now time.Time) (Session, string, error) {
+ 	id, err := newID()
+ 	if err != nil {
+ 		return Session{}, "", err
+ 	}
+ 	raw, err := newToken()
+ 	if err != nil {
+ 		return Session{}, "", err
+ 	}
+ 	sess := Session{
+ 		ID:        id,
+ 		UserID:    userID,
+-		TokenHash: hashToken(raw),
+-		ExpiresAt: now.Add(lifetime),
+-		LastSeen:  now,
++		ClientID:  clientID,
++		TokenHash: digestBearer(raw),
++		ExpiresAt: now.Add(absoluteTTL),
++		TouchedAt: now,
+ 	}
+ 	return sess, raw, nil
+ }
+-
+-// hashToken is the hex SHA-256 of the raw bearer token.
+-func hashToken(raw string) string {
+-	sum := sha256.Sum256([]byte(raw))
+-	return hex.EncodeToString(sum[:])
+-}
+-
+-// newID returns a random 128-bit session id as hex.
+-func newID() (string, error) {
+-	buf := make([]byte, 16)
+-	if _, err := rand.Read(buf); err != nil {
+-		return "", fmt.Errorf("auth: id: %w", err)
+-	}
+-	return hex.EncodeToString(buf), nil
+-}
+-
+-// newToken returns a random bearer token as hex.
+-func newToken() (string, error) {
+-	buf := make([]byte, tokenBytes)
+-	if _, err := rand.Read(buf); err != nil {
+-		return "", fmt.Errorf("auth: token: %w", err)
+-	}
+-	return hex.EncodeToString(buf), nil
+-}
+diff --git a/auth/service_test.go b/auth/service_test.go
+index 2e89139..506278d 100644
+--- a/auth/service_test.go
++++ b/auth/service_test.go
+@@ -8,91 +8,97 @@ import (
+ 
+ func fixedNow() time.Time {
+ 	return time.Date(2026, 4, 2, 15, 4, 5, 0, time.UTC)
+ }
+ 
+ func TestLoginAndAuthenticate(t *testing.T) {
+ 	svc := NewService(NewDirectory(), NewLog())
+ 	now := fixedNow()
+-	sess, raw, err := svc.Login("user-1", now)
++	sess, raw, err := svc.Login("user-1", "web-1", now)
+ 	if err != nil {
+ 		t.Fatalf("login: %v", err)
+ 	}
+-	if !sess.LastSeen.Equal(now) {
+-		t.Fatalf("last seen: %s", sess.LastSeen)
++	if sess.ClientID != "web-1" {
++		t.Fatalf("client: %s", sess.ClientID)
+ 	}
+-	if !sess.ExpiresAt.Equal(now.Add(lifetime)) {
++	if !sess.TouchedAt.Equal(now) {
++		t.Fatalf("touched: %s", sess.TouchedAt)
++	}
++	if !sess.ExpiresAt.Equal(now.Add(absoluteTTL)) {
+ 		t.Fatalf("expiry: %s", sess.ExpiresAt)
+ 	}
+ 	p, err := svc.Authenticate(sess.ID, raw, now)
+ 	if err != nil {
+ 		t.Fatalf("authenticate: %v", err)
+ 	}
+ 	if p.UserID != "user-1" || p.SessionID != sess.ID {
+ 		t.Fatalf("principal: %+v", p)
+ 	}
+ 	stored, err := svc.dir.Get(sess.ID, now)
+ 	if err != nil {
+ 		t.Fatalf("get: %v", err)
+ 	}
+-	if stored.UserID != "user-1" || stored.TokenHash != sess.TokenHash {
++	if stored.UserID != "user-1" || stored.ClientID != "web-1" || stored.TokenHash != sess.TokenHash {
+ 		t.Fatalf("stored: %+v", stored)
+ 	}
+ }
+ 
+ func TestRejectsBadToken(t *testing.T) {
+ 	svc := NewService(NewDirectory(), NewLog())
+ 	now := fixedNow()
+-	sess, _, err := svc.Login("user-1", now)
++	sess, _, err := svc.Login("user-1", "web-1", now)
+ 	if err != nil {
+ 		t.Fatalf("login: %v", err)
+ 	}
+ 	_, err = svc.Authenticate(sess.ID, "not-the-token", now)
+ 	if !errors.Is(err, ErrCredentials) {
+ 		t.Fatalf("got %v", err)
+ 	}
+ }
+ 
+ func TestRejectsExpired(t *testing.T) {
+ 	svc := NewService(NewDirectory(), NewLog())
+ 	now := fixedNow()
+-	sess, raw, err := svc.Login("user-1", now)
++	sess, raw, err := svc.Login("user-1", "web-1", now)
+ 	if err != nil {
+ 		t.Fatalf("login: %v", err)
+ 	}
+-	_, err = svc.Authenticate(sess.ID, raw, now.Add(lifetime))
++	_, err = svc.Authenticate(sess.ID, raw, now.Add(absoluteTTL))
+ 	if !errors.Is(err, ErrExpired) {
+ 		t.Fatalf("got %v", err)
+ 	}
+ }
+ 
+ func TestRefreshRotates(t *testing.T) {
+ 	svc := NewService(NewDirectory(), NewLog())
+ 	now := fixedNow()
+-	sess, raw, err := svc.Login("user-1", now)
++	sess, raw, err := svc.Login("user-1", "web-1", now)
+ 	if err != nil {
+ 		t.Fatalf("login: %v", err)
+ 	}
+ 	later := now.Add(time.Minute)
+ 	next, nextRaw, err := svc.Refresh(sess.ID, raw, later)
+ 	if err != nil {
+ 		t.Fatalf("refresh: %v", err)
+ 	}
+ 	if next.ID == sess.ID {
+ 		t.Fatal("expected a new session id")
+ 	}
+ 	if next.UserID != sess.UserID {
+ 		t.Fatalf("user: %s", next.UserID)
+ 	}
+-	if !next.ExpiresAt.Equal(later.Add(lifetime)) {
++	if next.ClientID != "web-1" {
++		t.Fatalf("client: %s", next.ClientID)
++	}
++	if !next.ExpiresAt.Equal(later.Add(absoluteTTL)) {
+ 		t.Fatalf("expiry: %s", next.ExpiresAt)
+ 	}
+-	if !next.LastSeen.Equal(later) {
+-		t.Fatalf("last seen: %s", next.LastSeen)
++	if !next.TouchedAt.Equal(later) {
++		t.Fatalf("touched: %s", next.TouchedAt)
+ 	}
+ 	if next.TokenHash == sess.TokenHash {
+ 		t.Fatal("expected a new token hash")
+ 	}
+ 	p, err := svc.Authenticate(next.ID, nextRaw, later)
+ 	if err != nil {
+ 		t.Fatalf("authenticate: %v", err)
+ 	}
+@@ -100,58 +106,73 @@ func TestRefreshRotates(t *testing.T) {
+ 		t.Fatalf("principal: %+v", p)
+ 	}
+ 	if svc.dir.has(sess.ID) {
+ 		t.Fatal("previous id still in the index")
+ 	}
+ 	if !svc.dir.has(next.ID) {
+ 		t.Fatal("successor missing from the index")
+ 	}
++	stored, err := svc.dir.Get(next.ID, later)
++	if err != nil {
++		t.Fatalf("get: %v", err)
++	}
++	if stored.ClientID != "web-1" || !stored.TouchedAt.Equal(later) {
++		t.Fatalf("stored: %+v", stored)
++	}
+ }
+ 
+ func TestRefreshRejectsBadToken(t *testing.T) {
+ 	svc := NewService(NewDirectory(), NewLog())
+ 	now := fixedNow()
+-	sess, _, err := svc.Login("user-1", now)
++	sess, _, err := svc.Login("user-1", "web-1", now)
+ 	if err != nil {
+ 		t.Fatalf("login: %v", err)
+ 	}
+ 	_, _, err = svc.Refresh(sess.ID, "not-the-token", now)
+ 	if !errors.Is(err, ErrCredentials) {
+ 		t.Fatalf("got %v", err)
+ 	}
+ }
+ 
+ func TestLogoutRetires(t *testing.T) {
+ 	svc := NewService(NewDirectory(), NewLog())
+ 	now := fixedNow()
+-	sess, raw, err := svc.Login("user-1", now)
++	sess, raw, err := svc.Login("user-1", "web-1", now)
+ 	if err != nil {
+ 		t.Fatalf("login: %v", err)
+ 	}
+ 	svc.Logout(sess.ID)
+ 	_, err = svc.Authenticate(sess.ID, raw, now)
+ 	if !errors.Is(err, ErrNotFound) {
+ 		t.Fatalf("after logout: %v", err)
+ 	}
+ }
+ 
+ func TestLoginRejectsBlankUser(t *testing.T) {
+ 	svc := NewService(NewDirectory(), NewLog())
+-	_, _, err := svc.Login("", fixedNow())
++	_, _, err := svc.Login("", "web-1", fixedNow())
++	if !errors.Is(err, ErrCredentials) {
++		t.Fatalf("got %v", err)
++	}
++}
++
++func TestLoginRejectsBlankClient(t *testing.T) {
++	svc := NewService(NewDirectory(), NewLog())
++	_, _, err := svc.Login("user-1", "", fixedNow())
+ 	if !errors.Is(err, ErrCredentials) {
+ 		t.Fatalf("got %v", err)
+ 	}
+ }
+ 
+ func TestEventsOnLoginAndRefresh(t *testing.T) {
+ 	log := NewLog()
+ 	svc := NewService(NewDirectory(), log)
+ 	now := fixedNow()
+-	sess, raw, err := svc.Login("user-1", now)
++	sess, raw, err := svc.Login("user-1", "web-1", now)
+ 	if err != nil {
+ 		t.Fatalf("login: %v", err)
+ 	}
+ 	later := now.Add(time.Minute)
+ 	next, _, err := svc.Refresh(sess.ID, raw, later)
+ 	if err != nil {
+ 		t.Fatalf("refresh: %v", err)
+ 	}
+diff --git a/auth/token.go b/auth/token.go
+new file mode 100644
+index 0000000..04f6ad1
+--- /dev/null
++++ b/auth/token.go
+@@ -0,0 +1,35 @@
++package auth
++
++import (
++	"crypto/rand"
++	"crypto/sha256"
++	"encoding/hex"
++	"fmt"
++)
++
++// tokenBytes is the raw bearer token length before hex encoding.
++const tokenBytes = 32
++
++// digestBearer is the hex SHA-256 of the raw bearer token.
++func digestBearer(raw string) string {
++	sum := sha256.Sum256([]byte(raw))
++	return hex.EncodeToString(sum[:])
++}
++
++// newID returns a random 128-bit session id as hex.
++func newID() (string, error) {
++	buf := make([]byte, 16)
++	if _, err := rand.Read(buf); err != nil {
++		return "", fmt.Errorf("auth: id: %w", err)
++	}
++	return hex.EncodeToString(buf), nil
++}
++
++// newToken returns a random bearer token as hex.
++func newToken() (string, error) {
++	buf := make([]byte, tokenBytes)
++	if _, err := rand.Read(buf); err != nil {
++		return "", fmt.Errorf("auth: token: %w", err)
++	}
++	return hex.EncodeToString(buf), nil
++}

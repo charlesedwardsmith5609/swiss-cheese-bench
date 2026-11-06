@@ -1,52 +1,48 @@
-'''On-hand and reserved units for the warehouse desk.'''
+"""Stock reserved for open orders.
+
+The OrderService that built this Inventory is the only mutator. On-hand
+counts are fixed for the life of the object.
+"""
 
 from __future__ import annotations
 
-import threading
+from orders.models import InventoryError, Order
 
 
-class StockError(Exception):
-    '''A reservation or receipt could not be applied.'''
+class Inventory:
+    """Available units are on-hand minus reserved."""
 
-
-class Stock:
-    '''Track on-hand and reserved units for each SKU.
-
-    Each mutating method takes the lock itself. Callers do not hold it,
-    and one Stock instance is not shared across desks.
-    '''
-
-    def __init__(self) -> None:
-        self._on_hand: dict[str, int] = {}
+    def __init__(self, on_hand: dict[str, int]) -> None:
+        self._on_hand = dict(on_hand)
         self._reserved: dict[str, int] = {}
-        self._lock = threading.Lock()
-
-    def receive(self, sku: str, qty: int) -> None:
-        '''Add received units to on-hand stock.'''
-        if qty <= 0:
-            raise StockError(f'{sku} qty must be positive')
-        with self._lock:
-            self._on_hand[sku] = self._on_hand.get(sku, 0) + qty
-
-    def reserve(self, sku: str, qty: int) -> None:
-        '''Hold units for a submitted or replaced line.'''
-        if qty <= 0:
-            raise StockError(f'{sku} qty must be positive')
-        with self._lock:
-            available = self._on_hand.get(sku, 0) - self._reserved.get(sku, 0)
-            if qty > available:
-                raise StockError(f'{sku} short by {qty - available}')
-            self._reserved[sku] = self._reserved.get(sku, 0) + qty
-
-    def release(self, sku: str, qty: int) -> None:
-        '''Return reserved units. On-hand stock is left unchanged.'''
-        if qty <= 0:
-            raise StockError(f'{sku} qty must be positive')
-        with self._lock:
-            reserved = self._reserved.get(sku, 0)
-            self._reserved[sku] = max(0, reserved - qty)
 
     def available(self, sku: str) -> int:
-        '''Units that can still be reserved.'''
-        with self._lock:
-            return self._on_hand.get(sku, 0) - self._reserved.get(sku, 0)
+        held = self._reserved.get(sku, 0)
+        return self._on_hand.get(sku, 0) - held
+
+    def reserved(self, sku: str) -> int:
+        return self._reserved.get(sku, 0)
+
+    def reserve(self, order: Order) -> None:
+        needed = self._totals(order)
+        for sku, qty in needed.items():
+            if qty > self.available(sku):
+                raise InventoryError(sku)
+        for sku, qty in needed.items():
+            self._reserved[sku] = self._reserved.get(sku, 0) + qty
+
+    def release(self, order: Order) -> None:
+        for sku, qty in self._totals(order).items():
+            remaining = self._reserved.get(sku, 0) - qty
+            if remaining < 0:
+                raise InventoryError(sku)
+            if remaining == 0:
+                self._reserved.pop(sku, None)
+            else:
+                self._reserved[sku] = remaining
+
+    def _totals(self, order: Order) -> dict[str, int]:
+        totals: dict[str, int] = {}
+        for line in order.lines:
+            totals[line.sku] = totals.get(line.sku, 0) + line.qty
+        return totals

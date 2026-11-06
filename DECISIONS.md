@@ -145,3 +145,14 @@ Autonomous run. Each entry: what was decided, why, and how to reverse it.
   (2) CLEAN controls contain issues the adjudicator calls real (e.g. h_clean_py_3 idle_at removal,
   h_clean_tf_2 extra KMS actions, h_clean_go_1 dropped UTC assertion), so the controls are not
   perfectly clean and strict precision overstates false positives.
+- D-36 Fixture fixes (round 2, Grok-authored with feedback): h_py_unrelated_deletion_1/2 and
+  h_go_unrelated_deletion_1 now delete a metrics counter, an audit-log call, and a hot-cache drop
+  (not bounds checks) to remove the category ambiguity; h_py_validation_disabled_1 re-authored
+  without the public API rename. Old versions are in .reviews/retired/round2 (gitignored).
+  Blind gpt-5.6-sol-high-fast audit of the four: each found exactly the seeded defect (the Go one
+  as a "dropped requirement": category ambiguity may remain). runs/hard-1 and reports/hard-1.md
+  belong to the PRE-swap fixtures; do not re-score hard-1 against the current fixtures dir (those
+  4 ids now have different labels). h_tf_secret_logged_1 (right category, different file) left
+  unchanged: strict file matching is deliberate and not changed after seeing results.
+- D-37 scripts/cross-review.sh now also excludes fixtures/ and reports/ from the diff it sends
+  (fixture data swamped the 60k-char limit and hid the code from the reviewer).

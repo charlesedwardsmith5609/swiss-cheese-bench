@@ -1,47 +1,38 @@
-'''Plain-text statements for collections letters.
+"""Plain-text invoice statements.
 
-Rendering takes an invoice that has already been issued. It does not allocate
-a number, apply a payment, or take the desk lock, so a letter can be built
-without posting.
-'''
+The ledger owns a StatementWriter and calls render after an invoice is built.
+Each line shows its net and tax amounts in cents. A totals block lists
+subtotal, tax, and total. Rendering does not touch the spool.
+"""
 
 from __future__ import annotations
 
-from billing.models import Invoice, describe_line, format_cents, payment_label
+from billing.models import Invoice, LineItem
 
 
-def render_statement(invoice: Invoice) -> str:
-    '''Render one invoice as text a clerk can drop into a letter.'''
-    rows = _heading(invoice)
-    rows.extend(_charges(invoice))
-    rows.extend(_payments(invoice))
-    if invoice.note:
-        rows.append(f'Note {invoice.note}')
-    rows.append(f'Due {format_cents(invoice.balance_cents)}')
-    return '\n'.join(rows) + '\n'
+class StatementWriter:
+    """Renders one posted invoice as text. Amounts stay in cents."""
 
+    def render(self, invoice: Invoice) -> str:
+        parts: list[str] = [
+            f"INVOICE {invoice.number}",
+            f"account {invoice.account_id}",
+            f"posted_by {invoice.posted_by}",
+            f"currency {invoice.currency}",
+        ]
+        if invoice.memo:
+            parts.append(f"memo {invoice.memo}")
+        parts.append("lines")
+        for line in invoice.lines:
+            parts.append(self._line(line))
+        parts.append("totals")
+        parts.append(f"subtotal {invoice.subtotal_cents}")
+        parts.append(f"tax {invoice.tax_cents}")
+        parts.append(f"total {invoice.total_cents()}")
+        return "\n".join(parts) + "\n"
 
-def _heading(invoice: Invoice) -> list[str]:
-    '''Identification lines printed above the charges.'''
-    return [
-        f'Invoice {invoice.invoice_id}',
-        f'Account {invoice.account_id}',
-        f'Status {invoice.status.value}',
-    ]
-
-
-def _charges(invoice: Invoice) -> list[str]:
-    '''Charge section in ledger order, followed by the open balance.'''
-    rows = ['Charges']
-    rows.extend(describe_line(line) for line in invoice.lines)
-    rows.append(f'Balance {format_cents(invoice.balance_cents)}')
-    return rows
-
-
-def _payments(invoice: Invoice) -> list[str]:
-    '''Payment section. An invoice with no payments still records that fact.'''
-    if not invoice.payments:
-        return ['Payments none']
-    rows = ['Payments']
-    rows.extend(payment_label(payment) for payment in invoice.payments)
-    return rows
+    def _line(self, line: LineItem) -> str:
+        return (
+            f"{line.sku} {line.description} x{line.quantity} "
+            f"net {line.net_cents()} tax {line.tax_cents()}"
+        )

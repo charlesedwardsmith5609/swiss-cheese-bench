@@ -1,160 +1,122 @@
-'''Post invoices and apply payments for one billing desk.
+"""Invoice ledger.
 
-Statement text is built here so a clerk can print a copy from the same
-object that posted the invoice. Number allocation and balance updates hold
-the desk lock for the duration of the mutation.
-'''
+issue and void hold the ledger lock for the whole call. The ledger owns the
+number book, the statement directory, and both indexes. Callers share a
+ledger only by using those methods; they do not touch the indexes directly.
+"""
 
 from __future__ import annotations
 
-from threading import Lock
+import threading
+from pathlib import Path
 
-from billing.models import (
-    BillingError,
-    Invoice,
-    InvoiceLine,
-    InvoiceStatus,
-    Payment,
-    Series,
-    describe_line,
-    format_cents,
-    line_total,
-    payment_label,
-)
+from billing.models import Draft, Invoice
+from billing.statements import StatementWriter
 from billing.audit import AuditLog
 
 
-class Ledger:
-    '''In-memory invoice book for a single desk.
+class Spool:
+    """One statement file. The ledger closes it when writing finishes."""
 
-    The ledger owns the invoice map, the idempotency keys, and the series
-    counters. The audit log is supplied by the caller and is not locked here.
-    '''
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._handle = open(path, "w", encoding="utf-8")
+        self._closed = False
 
-    def __init__(self, audit: AuditLog) -> None:
-        self._audit = audit
-        self._invoices: dict[str, Invoice] = {}
-        self._keys: set[str] = set()
-        self._series: dict[str, Series] = {}
-        self._lock = Lock()
+    def write(self, text: str) -> None:
+        self._handle.write(text)
 
-    def add_series(self, series: Series) -> None:
-        '''Register a numbering series. The code must be unique on this desk.'''
-        if series.code in self._series:
-            raise BillingError(f'series {series.code} already registered')
-        if series.next_no > series.ceiling:
-            raise BillingError(f'series {series.code} starts past its ceiling')
-        self._series[series.code] = series
+    def close(self) -> None:
+        if not self._closed:
+            self._handle.close()
+            self._closed = True
 
-    def issue(
-        self,
-        account_id: str,
-        lines: list[InvoiceLine],
-        series_code: str,
-    ) -> Invoice:
-        '''Assign the next number in the series and store the open invoice.'''
-        self._check_lines(lines)
-        self._lock.acquire()
-        try:
-            series = self._require_series(series_code)
-            closed = series.next_no > series.ceiling or not series.accepting
-            if closed:
-                raise BillingError(f'series {series.code} is closed')
-            number = series.next_no
-            series.next_no += 1
-            total = line_total(lines)
-            invoice = Invoice(
-                invoice_id=f'{series.prefix}-{number:06d}',
-                account_id=account_id,
-                lines=list(lines),
-                balance_cents=total,
-            )
-            self._invoices[invoice.invoice_id] = invoice
-            self._audit.record('issue', invoice.invoice_id, account_id)
-            return invoice
-        finally:
-            self._lock.release()
 
-    def apply_payment(self, invoice_id: str, payment: Payment) -> Invoice:
-        '''Apply a captured payment to an open invoice.'''
-        if payment.key in self._keys or payment.amt <= 0:
-            raise BillingError('payment rejected')
-        self._lock.acquire()
-        try:
-            invoice = self._require_open(invoice_id)
-            if payment.account_id != invoice.account_id:
-                raise BillingError('payment account does not match the invoice')
-            if payment.amt > invoice.balance_cents:
-                raise BillingError('payment exceeds the open balance')
-            invoice.balance_cents -= payment.amt
-            invoice.payments.append(payment)
-            if invoice.balance_cents == 0:
-                invoice.status = InvoiceStatus.PAID
-            self._keys.add(payment.key)
-            self._audit.record('apply', invoice.invoice_id, invoice.account_id)
-            return invoice
-        finally:
-            self._lock.release()
+class NumberBook:
+    """Monotonic invoice numbers, with give_back for a post that failed."""
 
-    def void(self, invoice_id: str) -> Invoice:
-        '''Void an open invoice. Applied payments stay on the document.'''
-        self._lock.acquire()
-        try:
-            invoice = self._require_open(invoice_id)
-            invoice.status = InvoiceStatus.VOID
-            self._audit.record('void', invoice.invoice_id, invoice.account_id)
-            return invoice
-        finally:
-            self._lock.release()
+    def __init__(self, start: int = 1000) -> None:
+        self._next = start
+        self._returned: list[int] = []
 
-    def statement(self, invoice_id: str) -> str:
-        '''Plain-text statement a clerk can put in a collections letter.'''
-        invoice = self._require(invoice_id)
-        rows: list[str] = [
-            f'Invoice {invoice.invoice_id}',
-            f'Account {invoice.account_id}',
-            f'Status {invoice.status.value}',
-            'Charges',
-        ]
-        for line in invoice.lines:
-            rows.append(describe_line(line))
-        rows.append(f'Balance {format_cents(invoice.balance_cents)}')
-        if invoice.payments:
-            rows.append('Payments')
-            for payment in invoice.payments:
-                rows.append(payment_label(payment))
+    def take(self) -> str:
+        if self._returned:
+            value = self._returned.pop()
         else:
-            rows.append('Payments none')
-        if invoice.note:
-            rows.append(f'Note {invoice.note}')
-        rows.append(f'Due {format_cents(invoice.balance_cents)}')
-        return '\n'.join(rows) + '\n'
+            value = self._next
+            self._next += 1
+        return f"INV-{value}"
 
-    def get(self, invoice_id: str) -> Invoice:
-        '''Return one stored invoice. Missing ids raise BillingError.'''
-        return self._require(invoice_id)
+    def give_back(self, number: str) -> None:
+        value = int(number.removeprefix("INV-"))
+        self._returned.append(value)
 
-    def _check_lines(self, lines: list[InvoiceLine]) -> None:
-        if not lines:
-            raise BillingError('an invoice needs at least one line')
-        for line in lines:
-            if line.amt <= 0:
-                raise BillingError(f'{line.sku} amt must be positive')
 
-    def _require_series(self, code: str) -> Series:
+class Ledger:
+    """Posts drafts and voids invoices.
+
+    The lock taken by issue and void is the only guard around the indexes.
+    """
+
+    def __init__(self, directory: str, audit: AuditLog | None = None) -> None:
+        self._directory = directory
+        self._audit = audit if audit is not None else AuditLog()
+        self._writer = StatementWriter()
+        self._numbers = NumberBook()
+        self._lock = threading.Lock()
+        self._by_number: dict[str, Invoice] = {}
+        self._by_customer: dict[str, list[str]] = {}
+        Path(directory).mkdir(parents=True, exist_ok=True)
+
+    def issue(self, draft: Draft, now: int) -> Invoice:
+        """Post draft, index it by customer_id, and write the statement file."""
+        self._lock.acquire()
         try:
-            return self._series[code]
-        except KeyError as exc:
-            raise BillingError(f'unknown series {code}') from exc
+            number = self._numbers.take()
+            spool = Spool(str(Path(self._directory) / f"{number}.stmt"))
+            try:
+                invoice = Invoice(
+                    number=number,
+                    customer_id=draft.customer_id,
+                    currency=draft.currency,
+                    lines=tuple(draft.lines),
+                    memo=draft.memo,
+                    subtotal_cents=draft.subtotal_cents(),
+                    issued_at=now,
+                )
+                spool.write(self._writer.render(invoice))
+                self._by_number[number] = invoice
+                self._by_customer.setdefault(draft.customer_id, []).append(number)
+                self._audit.record_post(number, draft.customer_id, invoice.total_cents())
+                return invoice
+            except Exception:
+                self._numbers.give_back(number)
+                raise
+            finally:
+                spool.close()
+        finally:
+            self._lock.release()
 
-    def _require(self, invoice_id: str) -> Invoice:
+    def void(self, number: str) -> Invoice:
+        """Remove a posted invoice from the customer index."""
+        self._lock.acquire()
         try:
-            return self._invoices[invoice_id]
-        except KeyError as exc:
-            raise BillingError(f'unknown invoice {invoice_id}') from exc
+            invoice = self._by_number.pop(number)
+            bucket = self._by_customer.get(invoice.customer_id, [])
+            self._by_customer[invoice.customer_id] = [
+                item for item in bucket if item != number
+            ]
+            self._audit.record_void(number, invoice.customer_id, invoice.total_cents())
+            return invoice
+        finally:
+            self._lock.release()
 
-    def _require_open(self, invoice_id: str) -> Invoice:
-        invoice = self._require(invoice_id)
-        if invoice.status is not InvoiceStatus.OPEN:
-            raise BillingError(f'invoice {invoice_id} is {invoice.status.value}')
-        return invoice
+    def get(self, number: str) -> Invoice:
+        return self._by_number[number]
+
+    def numbers_for(self, customer_id: str) -> tuple[str, ...]:
+        return tuple(self._by_customer.get(customer_id, ()))
+
+    def statement_text(self, number: str) -> str:
+        path = Path(self._directory) / f"{number}.stmt"
+        return path.read_text(encoding="utf-8")

@@ -1,5 +1,5 @@
 {
   "id": "h_py_unrelated_deletion_1",
   "language": "python",
-  "task": "Move tax and freight calculation out of the order service into a new pricing module with an explicit rate card, and use that module when submitting an order and when replacing a line. Rename LineItem.qty to quantity through the order, stock, and desk code so stored lines match the warehouse payload. Thread a requested_by actor through submit, replace_line, and cancel, and store that actor on the audit entry instead of assuming the customer id. Refresh the docstrings and order the imports to match the rest of the package."
+  "task": "Extract catalog pricing from the order service into a PriceBook that prices each line in integer cents and writes the unit price back onto the line. Record the clerk who confirms shipment on the order and on the fulfillment audit event. Rename the line-item field qty to quantity in the models and every caller. Add a short docstring on each public OrderService method. Stock holds on place and stock returns on cancel stay on the inventory collaborator."
 }

@@ -24,7 +24,7 @@ review_resolve "$provider" "$model" || exit 2
 
 # Include new, untracked files in the diff without staging their content.
 git add --intent-to-add --all >/dev/null 2>&1 || true
-get_diff() { git diff --no-color "$1" -- . ':(exclude)go.sum' ':(exclude)**/go.sum' ':(exclude)package-lock.json' ':(exclude)**/package-lock.json'; }
+get_diff() { git diff --no-color "$1" -- . ':(exclude)go.sum' ':(exclude)**/go.sum' ':(exclude)package-lock.json' ':(exclude)**/package-lock.json' ':(exclude)fixtures' ':(exclude)reports'; }
 diff=$(get_diff "$base")
 # Nothing uncommitted and no --base given: review the last commit instead.
 if [ -z "$diff" ] && [ "$base_given" = 0 ] && git rev-parse -q --verify HEAD~1 >/dev/null; then
