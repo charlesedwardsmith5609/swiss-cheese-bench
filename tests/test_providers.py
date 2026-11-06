@@ -14,7 +14,7 @@ from swiss_cheese_bench.providers import (
     ProviderError,
     make_provider,
 )
-from tests.stub_server import StubServer, anthropic_reply, openai_reply
+from tests.stub_server import StubServer, anthropic_reply, call_bounded, openai_reply
 
 API_KEY_VALUE = "fake-aaaa-placeholder"
 
@@ -81,17 +81,21 @@ def test_bad_responses_raise_provider_error_without_key(
 def test_hung_server_times_out(servers: list[StubServer]) -> None:
     stub = _stub(servers, mode="hang")
     start = time.monotonic()
-    with pytest.raises(ProviderError):
-        OpenAIProvider(API_KEY_VALUE, stub.base_url).complete("m", "s", "u", 10, 0.5)
-    assert time.monotonic() - start < 5
+    err = call_bounded(
+        lambda: OpenAIProvider(API_KEY_VALUE, stub.base_url).complete("m", "s", "u", 10, 0.5), 8
+    )
+    assert isinstance(err, ProviderError)
+    assert time.monotonic() - start < 4
 
 
 def test_trickling_server_hits_whole_call_deadline(servers: list[StubServer]) -> None:
     stub = _stub(servers, mode="trickle")
     start = time.monotonic()
-    with pytest.raises(ProviderError):
-        OpenAIProvider(API_KEY_VALUE, stub.base_url).complete("m", "s", "u", 10, 0.5)
-    assert time.monotonic() - start < 3
+    err = call_bounded(
+        lambda: OpenAIProvider(API_KEY_VALUE, stub.base_url).complete("m", "s", "u", 10, 0.5), 8
+    )
+    assert isinstance(err, ProviderError)
+    assert time.monotonic() - start < 4
 
 
 def test_oversized_body_rejected(servers: list[StubServer]) -> None:
@@ -140,9 +144,11 @@ def test_dry_run_provider_is_deterministic_and_valid_json() -> None:
 def test_slow_header_trickle_hits_deadline(servers: list[StubServer]) -> None:
     stub = _stub(servers, mode="slowheader")
     start = time.monotonic()
-    with pytest.raises(ProviderError):
-        OpenAIProvider(API_KEY_VALUE, stub.base_url).complete("m", "s", "u", 10, 0.5)
-    assert time.monotonic() - start < 3
+    err = call_bounded(
+        lambda: OpenAIProvider(API_KEY_VALUE, stub.base_url).complete("m", "s", "u", 10, 0.5), 8
+    )
+    assert isinstance(err, ProviderError)
+    assert time.monotonic() - start < 4
 
 
 def test_key_with_control_characters_is_rejected_without_echo() -> None:
@@ -166,5 +172,11 @@ def test_absurd_token_counts_rejected(servers: list[StubServer]) -> None:
     huge = b'{"choices": [{"message": {"content": "x"}}], "usage": {"prompt_tokens": ' + b"9" * 400
     huge += b', "completion_tokens": 1}}'
     stub = _stub(servers, lambda p, h, b: (200, huge))
+    with pytest.raises(ProviderError):
+        OpenAIProvider(API_KEY_VALUE, stub.base_url).complete("m", "s", "u", 10, 5)
+
+
+def test_huge_integer_in_response_is_provider_error(servers: list[StubServer]) -> None:
+    stub = _stub(servers, lambda p, h, b: (200, b'{"choices": [' + b"9" * 6000 + b"]}"))
     with pytest.raises(ProviderError):
         OpenAIProvider(API_KEY_VALUE, stub.base_url).complete("m", "s", "u", 10, 5)

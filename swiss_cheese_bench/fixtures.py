@@ -146,6 +146,8 @@ def make_diff(base_dir: Path, after_dir: Path) -> str:
 
 def _read_json(path: Path, fixture_id: str) -> dict[str, object]:
     try:
+        if path.stat().st_size > MAX_FILE_BYTES:
+            raise FixtureError(f"{fixture_id}: {path.name} exceeds {MAX_FILE_BYTES} bytes")
         data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
         raise FixtureError(f"{fixture_id}: missing {path.name}") from exc

@@ -110,3 +110,23 @@ def openai_reply(text: str, tin: int = 100, tout: int = 50) -> bytes:
             "usage": {"prompt_tokens": tin, "completion_tokens": tout},
         }
     ).encode()
+
+
+def call_bounded(fn: Callable[[], object], limit_s: float) -> BaseException | None:
+    """Run fn in a daemon thread; fail the test if it does not finish within limit_s.
+
+    Returns the exception fn raised (or None), so callers can assert on it.
+    """
+    box: list[BaseException] = []
+
+    def target() -> None:
+        try:
+            fn()
+        except BaseException as exc:  # noqa: BLE001 - handed back to the test
+            box.append(exc)
+
+    worker = threading.Thread(target=target, daemon=True)
+    worker.start()
+    worker.join(limit_s)
+    assert not worker.is_alive(), f"call did not finish within {limit_s}s"
+    return box[0] if box else None

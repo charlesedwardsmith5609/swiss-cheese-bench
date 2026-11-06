@@ -6,6 +6,7 @@ Threading: none; pure functions.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -37,12 +38,11 @@ class ParseResult:
     invalid: int = 0
 
 
-def _candidates(text: str) -> list[Any]:
+def _candidates(text: str) -> Iterator[Any]:
     """JSON values found in text: the whole text first, then each fenced/embedded value."""
-    values: list[Any] = []
     try:
-        values.append(json.loads(text))
-        return values
+        yield json.loads(text)
+        return
     except (ValueError, RecursionError):
         pass
     decoder = json.JSONDecoder()
@@ -56,11 +56,10 @@ def _candidates(text: str) -> list[Any]:
                 failures += 1  # bounds the work on adversarial input (no quadratic rescans)
                 index += 1
                 continue
-            values.append(value)
+            yield value
             index = end
         else:
             index += 1
-    return values
 
 
 def _one(item: object) -> Finding | None:

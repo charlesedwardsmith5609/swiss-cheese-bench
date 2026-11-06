@@ -56,3 +56,23 @@ Autonomous run. Each entry: what was decided, why, and how to reverse it.
   "scored" count, because all comparisons use the common cohort, so the denominator is always the
   bucket size. check passed (102 tests). No cross-review at this step (reserved for the end of
   step 4, which covers the whole diff since step 2).
+- D-20 Step-4 plan review: agreed with 5 of 6. Disagreed with "wait for human approval before
+  applying cross-review fixes": the user asked for an unattended run, so I apply findings I agree
+  with, rerun check.sh, and log them here. Adopted: projected-cost labels in dry run, per-report
+  chart filename, atomic two-file write with exit 2 on OSError, numeric chart assertions,
+  tolerant metadata getters.
+- D-21 Step-4 cross-review (diff vs HEAD~2, truncated at 60k of 129k chars: most of the diff,
+  notably fixtures, was NOT seen). Agreed and fixed: JSON ValueError in provider responses;
+  connect before send plus expiry check so a slow connect cannot be followed by a late paid
+  request; size limits on meta/label JSON and results.jsonl; lazy candidate scan; reject rows
+  with parse_ok=false but findings; test calls to timeout paths run in bounded worker threads.
+- D-22 Not fixed (accepted limits): DNS resolution is not interruptible by the watchdog (a
+  stalled resolver could hang a run; fix would be a resolver thread); report writes are two
+  renames, chart first and Markdown last, not a single atomic step; results.jsonl is still read
+  fully in memory up to its 512 MiB cap.
+- D-23 `examples/dry-run-report.md` is committed as a demo and is loudly labelled SIMULATED.
+  bench.example.json uses PLACEHOLDER prices and an unset OpenAI model id on purpose; I did not
+  assume current prices. The first live run needs a real bench.json.
+- D-24 NOT DONE: no live run was made (no keys used, nothing spent), so there are no real
+  results. NOT DONE: push, because no git remote exists. Run `git remote add origin <url> &&
+  git push -u origin main`.

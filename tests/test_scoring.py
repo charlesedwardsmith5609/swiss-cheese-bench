@@ -311,3 +311,12 @@ def test_scores_a_real_dry_run_end_to_end(tmp_path: Path) -> None:
     s = score_run(out, FIXTURES)
     assert s.dry_run and len(s.cohort) == 24
     assert s.configs["A"].cost_incurred_usd > 0
+
+
+def test_unparsable_row_with_findings_rejected(tmp_path: Path) -> None:
+    _good_run(tmp_path)
+    lines = (tmp_path / "results.jsonl").read_text().splitlines()
+    idx = next(i for i, x in enumerate(lines) if json.loads(x)["findings"])
+    _mutate_line(tmp_path, idx, lambda o: o.update(parse_ok=False))
+    with pytest.raises(ScoringError, match="unparsable"):
+        load_results(tmp_path, FIXTURES)

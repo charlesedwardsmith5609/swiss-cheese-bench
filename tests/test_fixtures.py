@@ -184,3 +184,11 @@ def test_oversized_diff_rejected(tmp_path: Path) -> None:
     (root / "fx" / "diff.patch").write_text("x" * (300 * 1024), encoding="utf-8")
     with pytest.raises(FixtureError, match="exceeds"):
         load_fixtures(root)
+
+
+def test_oversized_meta_rejected(tmp_path: Path) -> None:
+    root = _write_fixture(tmp_path, label=GOOD_LABEL)
+    big = {"id": "fx", "language": "python", "task": "t" * (300 * 1024)}
+    (root / "fx" / "meta.json").write_text(json.dumps(big), encoding="utf-8")
+    with pytest.raises(FixtureError, match="exceeds"):
+        load_fixtures(root)

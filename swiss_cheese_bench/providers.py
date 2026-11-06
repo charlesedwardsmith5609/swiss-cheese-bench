@@ -90,6 +90,9 @@ def _post(
     watchdog.daemon = True
     watchdog.start()
     try:
+        conn.connect()
+        if expired.is_set():  # a slow connect/DNS lookup must not be followed by a late paid send
+            raise ProviderError("request timed out")
         conn.request("POST", parts.path.rstrip("/") + path, body=body, headers=headers)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -133,7 +136,10 @@ def _post(
 def _json_object(data: bytes) -> dict[str, object]:
     try:
         parsed = json.loads(data)
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+    except (
+        ValueError,
+        RecursionError,
+    ) as exc:  # ValueError covers JSONDecodeError, int digit limit
         raise ProviderError("response is not valid JSON") from exc
     if not isinstance(parsed, dict):
         raise ProviderError("response is not a JSON object")

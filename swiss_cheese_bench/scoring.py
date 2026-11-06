@@ -39,6 +39,7 @@ STATUSES = frozenset({"ok", "error", "skipped_cost_cap", "skipped_dependency", "
 SCORED_STATUSES = frozenset({"ok", "dry_run"})
 BUCKETS = ("both", "A_only", "B_only", "neither")
 OVERALL = "overall"
+MAX_RESULTS_BYTES = 512 * 1024 * 1024
 
 
 class ScoringError(Exception):
@@ -217,6 +218,8 @@ def _row(raw: object, lineno: int, dry_run: bool) -> CallRow:
     parse_ok = raw.get("parse_ok")
     if not isinstance(parse_ok, bool):
         raise ScoringError(f"{where}: parse_ok must be a boolean")
+    if not parse_ok and findings_raw:
+        raise ScoringError(f"{where}: unparsable output cannot carry findings")
     cost, projected = (
         _num(raw.get("cost_usd"), f"{where}: cost_usd"),
         _num(raw.get("projected_cost_usd"), f"{where}: projected_cost_usd"),
@@ -238,7 +241,10 @@ def _row(raw: object, lineno: int, dry_run: bool) -> CallRow:
 def load_results(run_dir: Path, fixtures: list[Fixture]) -> tuple[RunMeta, list[CallRow]]:
     try:
         meta_raw = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
-        lines = (run_dir / "results.jsonl").read_text(encoding="utf-8").splitlines()
+        results_path = run_dir / "results.jsonl"
+        if results_path.stat().st_size > MAX_RESULTS_BYTES:
+            raise ScoringError(f"results.jsonl exceeds {MAX_RESULTS_BYTES} bytes")
+        lines = results_path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ScoringError(f"cannot read run in {run_dir}: {exc}") from exc
     if not isinstance(meta_raw, dict) or not isinstance(meta_raw.get("dry_run"), bool):

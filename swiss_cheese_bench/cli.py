@@ -6,13 +6,16 @@ import argparse
 import dataclasses
 import os
 import sys
+import tempfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from swiss_cheese_bench.config import ConfigError, load_config
 from swiss_cheese_bench.fixtures import FixtureError, load_fixtures
 from swiss_cheese_bench.providers import Provider, ProviderError, make_provider
+from swiss_cheese_bench.report import render_chart, render_report
 from swiss_cheese_bench.runner import run_bench
+from swiss_cheese_bench.scoring import ScoringError, score_run
 
 
 def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None) -> int:
@@ -24,7 +27,13 @@ def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None
     run.add_argument("--out", type=Path, default=Path("runs/latest"))
     run.add_argument("--cap-usd", type=float, default=None, help="override the config cap")
     run.add_argument("--dry-run", action="store_true", help="no network, nothing spent")
+    rep = sub.add_parser("report", help="score a finished run and write a Markdown report")
+    rep.add_argument("--run", type=Path, required=True, help="run directory")
+    rep.add_argument("--fixtures", type=Path, default=Path("fixtures"))
+    rep.add_argument("--out", type=Path, default=Path("report.md"))
     args = parser.parse_args(argv)
+    if args.command == "report":
+        return _report(args.run, args.fixtures, args.out)
     environ = os.environ if env is None else env
     try:
         config = load_config(args.config)
@@ -45,4 +54,31 @@ def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None
         f"committed (incl. reservations) ${summary.committed_usd:.4f} of cap ${summary.cap_usd:.2f}"
     )
     print(f"results: {args.out}/results.jsonl")
+    return 0
+
+
+def _report(run_dir: Path, fixtures_dir: Path, out: Path) -> int:
+    """Render both files first, then replace them in place; any failure leaves no half report."""
+    chart_path = out.with_name(out.stem + ".chart.svg")
+    try:
+        scoring = score_run(run_dir, load_fixtures(fixtures_dir))
+        chart = render_chart(scoring)
+        markdown = render_report(scoring, chart_path.name)
+        staged: list[tuple[Path, Path]] = []
+        try:
+            for target, text in ((chart_path, chart), (out, markdown)):
+                fd, tmp_name = tempfile.mkstemp(dir=target.parent, prefix=".scb-", suffix=".tmp")
+                tmp = Path(tmp_name)
+                staged.append((tmp, target))
+                with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write(text)
+            for tmp, target in staged:
+                tmp.replace(target)
+        finally:
+            for tmp, _ in staged:
+                tmp.unlink(missing_ok=True)
+    except (ScoringError, FixtureError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(f"wrote {out} and {chart_path}")
     return 0
