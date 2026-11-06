@@ -1,0 +1,22 @@
+{
+  "_comment": "Prices are PLACEHOLDERS (USD per million tokens). Set the real current prices for your models before a paid run; cost-per-catch is only as good as these numbers.",
+  "models": {
+    "A": {
+      "provider": "anthropic",
+      "model_id": "claude-sonnet-5-5",
+      "usd_per_mtok_in": 3.0,
+      "usd_per_mtok_out": 15.0,
+      "api_key_env": "ANTHROPIC_API_KEY"
+    },
+    "B": {
+      "provider": "openai",
+      "model_id": "set-an-openai-model-id",
+      "usd_per_mtok_in": 2.5,
+      "usd_per_mtok_out": 10.0,
+      "api_key_env": "OPENAI_API_KEY"
+    }
+  },
+  "max_output_tokens": 2000,
+  "timeout_s": 120,
+  "cap_usd": 5.0
+}

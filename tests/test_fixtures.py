@@ -177,3 +177,10 @@ def test_missing_and_bad_meta_raise_fixture_error(tmp_path: Path) -> None:
     (root / "fx" / "meta.json").write_text('{"id": "fx", "language": "cobol", "task": "t"}')
     with pytest.raises(FixtureError):
         load_fixtures(root)
+
+
+def test_oversized_diff_rejected(tmp_path: Path) -> None:
+    root = _write_fixture(tmp_path, label=GOOD_LABEL)
+    (root / "fx" / "diff.patch").write_text("x" * (300 * 1024), encoding="utf-8")
+    with pytest.raises(FixtureError, match="exceeds"):
+        load_fixtures(root)

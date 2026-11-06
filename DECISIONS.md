@@ -22,3 +22,26 @@ Autonomous run. Each entry: what was decided, why, and how to reverse it.
 - D-08 Go fixtures were syntax-checked with `gofmt -e` by hand (not part of check.sh). Terraform
   fixtures are unchecked (no terraform binary). Ground truth was re-read against INVENTORY.md.
 - D-09 Step 1 done: check passed (ruff check, format, mypy, pytest 17). Committed locally.
+- D-10 Step-2 plan review: agreed with 7 of 8. Adopted: pessimistic byte-based cost reservation
+  that stays charged on error; http.client with whole-call deadline and 1 MiB body cap; https
+  required except loopback; dry-run cost_usd=0 with separate projected cost; strict findings
+  top-level schema; prompt test allows the category taxonomy; test-server cleanup via events and
+  bounded joins.
+- D-11 Disagreed (partly) on removing A_union_B: removed from the runner, but I will compute an
+  independent-union view in scoring/report (steps 3-4), since "does pairing beat either alone"
+  needs it. No extra API calls.
+- D-12 No temperature parameter is sent to any provider (some current models reject it), so runs
+  are not strictly reproducible. No retries. Results are one sample per (fixture, call).
+- D-13 Step-2 cross-review (diff truncated at 60k chars by the script, so the tail of the test
+  files was probably not reviewed). Agreed with all 6 findings and fixed them: watchdog timer
+  that shuts the socket down at the whole-call deadline (covers header trickling; this adds one
+  short-lived timer thread per call that only calls socket.shutdown, so the runner is still
+  single-threaded in the sense of state ownership); API key stripped and rejected if non-printable,
+  and transport/header errors never echo exception text; dry-run keeps worst-case reservations
+  committed so its cap preview matches a live run; token counts bounded to 1e9; parser catches
+  ValueError (int-digit limit); fixture count/size limits.
+- D-14 Test API keys are obviously fake strings; the first one tripped gitleaks in the review
+  script (correctly refusing to send), so they were renamed to low-entropy placeholders.
+- D-15 Known limit: connect uses the socket timeout and is not covered by the watchdog's abort
+  (socket does not exist yet); worst case a call takes ~2x timeout_s. Left as is.
+- D-16 Step 2 done: check passed (79 tests). Committed locally.

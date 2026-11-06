@@ -16,6 +16,8 @@ from enum import StrEnum
 from pathlib import Path
 
 GIT_TIMEOUT_S = 30
+MAX_FIXTURES = 1000
+MAX_FILE_BYTES = 256 * 1024
 LANGUAGES = frozenset({"python", "go", "terraform"})
 
 
@@ -211,7 +213,10 @@ def load_fixture(directory: Path) -> Fixture:
     task = _field_str(meta, "task", fixture_id, "meta.json")
     label = _load_label(_read_json(directory / "label.json", fixture_id), fixture_id)
     try:
-        diff = (directory / "diff.patch").read_text(encoding="utf-8")
+        patch = directory / "diff.patch"
+        if patch.stat().st_size > MAX_FILE_BYTES:
+            raise FixtureError(f"{fixture_id}: diff.patch exceeds {MAX_FILE_BYTES} bytes")
+        diff = patch.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         raise FixtureError(f"{fixture_id}: cannot read diff.patch: {exc}") from exc
     base, after = directory / "base", directory / "after"
@@ -226,6 +231,8 @@ def load_fixtures(root: Path) -> list[Fixture]:
     if not root.is_dir():
         raise FixtureError(f"fixtures root not found: {root}")
     dirs = sorted(p for p in root.iterdir() if p.is_dir())
+    if len(dirs) > MAX_FIXTURES:
+        raise FixtureError(f"too many fixtures ({len(dirs)} > {MAX_FIXTURES})")
     return [load_fixture(d) for d in dirs]
 
 
