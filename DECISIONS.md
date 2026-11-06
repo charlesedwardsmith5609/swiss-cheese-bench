@@ -115,3 +115,18 @@ Autonomous run. Each entry: what was decided, why, and how to reverse it.
   tier. Disagreed and not changed: thread-safety / unbounded message size / panic-in-metrics
   hardening of the CLEAN fixtures (h_clean_py_3, h_clean_go_1): the tasks do not ask for it, and
   hardening beyond the task would make controls synthetic.
+- D-33 Hard-tier pilot (runs/hard-1, report reports/hard-1.md, in-sample calibration, $1.11 spent,
+  96/96 calls ok). Recall A 19/24, B 19/24 (both 79%, inside the 40-90% band: criterion (a) MET).
+  No defect was caught by exactly one model; A-only 0, B-only 0, and A, B, A-then-B and A-union-B
+  all caught the same 19: criterion (b) NOT MET. Per the approved plan the step is reported as
+  NOT MET against R5; no further paid run without the user's OK.
+  Why the 5 shared misses happened (read from the stored findings, no new spend):
+  - 3x unrelated_deletion: BOTH models found the real defect (a removed negative-index / ceiling
+    check) but labelled it validation_disabled. The seeded deletions are all bounds checks, so the
+    category is ambiguous by construction: a fixture-design flaw, not a detection miss.
+  - 1x secret_logged (h_tf_secret_logged_1): right category, but they named locals.tf where the
+    label says outputs.tf; strict file matching scored it a miss.
+  - 1x validation_disabled (h_py_validation_disabled_1): both flagged an unintended rename of the
+    public ReceiptLog class (a real second defect in a Grok-authored fixture I had only
+    label-checked: the D-30 risk materialised). The seeded loosening itself was missed by both.
+  Pairing gave no benefit here; the two models' errors were perfectly correlated.
