@@ -87,3 +87,24 @@ Autonomous run. Each entry: what was decided, why, and how to reverse it.
   OpenAI-authored fixtures, Grok-authored ones audited by me/user, pilot labelled in-sample;
   `verify=False` dropped from validation_disabled; per-slice cost attribution; transactional
   materialization; 1 MiB reply cap; test assertion allows .reviews/authoring/.
+- D-28 Authoring models: xhigh (grok-4.7-xhigh, gpt-5.6-sol-xhigh) and grok-4.7-high produced no
+  reply within 15 min on the full fixture prompt (the CLI only emits at the end; reasoning runs
+  very long). Used grok-4.7-medium-fast and gpt-5.6-sol-high-fast instead (both finished a cell in
+  ~12 min), 6 cells in parallel, per-call timeout raised to 30 min. This is below the "most
+  advanced" setting you asked for; quality is covered by the audit gate.
+- D-29 Hard-tier fixtures authored (32). Audit: Grok audited the 16 OpenAI-authored fixtures
+  without seeing labels. Clean controls came back NONE. Two defective fixtures
+  (h_go_hardcoded_expected_1, h_py_hardcoded_expected_1) were flagged for a second, unintended
+  defect (FIFO ordering requirement; ignored revoke() result); both were re-authored with the
+  audit feedback and re-audited: now exactly the seeded defect. h_tf_overbroad_iam_1 was flagged
+  for noncurrent-version retention and missing schedule tags; I judged those not defects and kept
+  it (flagged in INVENTORY.md for your spot-check).
+- D-30 The 16 Grok-authored fixtures had NO model audit (per plan). I read 9 in full and checked
+  only labels and evidence lines for the other 7 (h_go_test_bypasses_route_2,
+  h_go_validation_disabled_1, h_py_unrelated_deletion_1/2, h_py_validation_disabled_1/2,
+  h_clean_tf_1). Those 7 are the least verified: please spot-check them before trusting results.
+  Possible non-category extras noticed: h_go_unrelated_deletion_1 lets the caller supply the audit
+  actor (spoofable); judged outside the 8 categories.
+- D-31 Authoring settings were medium-fast/high-fast, not xhigh (see D-28). Fixtures were authored
+  by Grok and OpenAI models, so family effects remain possible; the first hard-tier pilot is
+  in-sample calibration.

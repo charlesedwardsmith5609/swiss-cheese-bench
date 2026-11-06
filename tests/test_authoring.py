@@ -228,3 +228,10 @@ def test_example_text_and_prompt_have_no_ground_truth_leak_for_the_new_fixture()
     assert "swallowed_error" in prompt  # the author is told the hidden category (it must write it)
     assert str(authoring.MAX_CHANGED_LINES) in prompt and "Language: python" in prompt
     assert "was rejected" in authoring.build_prompt(CELL, example, "bad thing")
+
+
+def test_prompt_includes_audit_note_only_when_given() -> None:
+    plain = authoring.build_prompt(CELL, "EX")
+    noted = authoring.build_prompt(CELL, "EX", note="FIFO order is wrong")
+    assert "audit of an earlier attempt" not in plain
+    assert "FIFO order is wrong" in noted and "exactly the one seeded defect" in noted

@@ -34,7 +34,7 @@ MIN_CHANGED_FILES, MAX_CHANGED_FILES = 3, 6
 MIN_CHANGED_LINES, MAX_CHANGED_LINES = 100, 250
 MAX_REPLY_BYTES = 1024 * 1024
 MAX_FIELD_CHARS = 2000
-AGENT_TIMEOUT_S = 900.0
+AGENT_TIMEOUT_S = 1800.0
 MAX_RETRIES = 2
 SUFFIXES = {
     "python": {".py", ".toml", ".txt", ".md"},
@@ -207,7 +207,9 @@ SCHEMA = (
 )
 
 
-def build_prompt(cell: Cell, example: str, error: str | None = None) -> str:
+def build_prompt(
+    cell: Cell, example: str, error: str | None = None, note: str | None = None
+) -> str:
     rules = CLEAN_DECOYS if cell.category is Category.NONE else DESIGN[str(cell.category)]
     kind = (
         "a clean control (no defect)"
@@ -228,6 +230,12 @@ def build_prompt(cell: Cell, example: str, error: str | None = None) -> str:
         SCHEMA,
         "Format example of a finished (easier, smaller) fixture, as JSON:\n" + example,
     ]
+    if note:
+        parts.append(
+            "Feedback from an audit of an earlier attempt at this cell. It contained these "
+            "UNINTENDED extra problems, which you must avoid; the fixture must contain exactly "
+            f"the one seeded defect and nothing else wrong:\n{note}"
+        )
     if error:
         parts.append(f"Your previous reply was rejected: {error}\nFix that and reply again.")
     return "\n\n".join(parts)
@@ -451,11 +459,14 @@ def run_cell(
     model: str | None = None,
     agent_bin: str = "agent",
     timeout_s: float = AGENT_TIMEOUT_S,
+    note: str | None = None,
 ) -> Path:
     model = model or AUTHOR_MODELS[cell.author]
     error: str | None = None
     for attempt in range(MAX_RETRIES + 1):
-        reply = run_agent(build_prompt(cell, example, error), model, work_dir, agent_bin, timeout_s)
+        reply = run_agent(
+            build_prompt(cell, example, error, note), model, work_dir, agent_bin, timeout_s
+        )
         try:
             return materialize(parse_authored(reply, cell), root, model)
         except AuthoringError as exc:
@@ -496,6 +507,7 @@ def main(argv: list[str]) -> int:
     run.add_argument("--fixtures", type=Path, default=Path("fixtures"))
     run.add_argument("--work", type=Path, default=Path(".reviews/authoring"))
     run.add_argument("--agent", default="agent")
+    run.add_argument("--note", default=None, help="audit feedback appended to the prompt")
     run.add_argument("--model", default=None, help="override the planned author model")
     args = parser.parse_args(argv[1:])
     if args.command == "list":
@@ -515,7 +527,13 @@ def main(argv: list[str]) -> int:
             continue
         try:
             path = run_cell(
-                CELL_BY_ID[cell_id], args.fixtures, example, args.work, args.model, args.agent
+                CELL_BY_ID[cell_id],
+                args.fixtures,
+                example,
+                args.work,
+                args.model,
+                args.agent,
+                note=args.note,
             )
             print(f"{cell_id}: wrote {path}")
         except AuthoringError as exc:
